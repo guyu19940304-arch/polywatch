@@ -35,7 +35,7 @@ curl http://127.0.0.1:8787/api/health
 curl http://127.0.0.1:8787/api/monitor
 ```
 
-`/api/health` 表示服务能够响应，不代表上游数据完整或新鲜。`/api/monitor` 提供采集错误、更新时刻及补录状态。首次同步尚未保存钱包快照时，钱包接口会返回 `503 initial_sync`，随后自动重试。
+`/api/health` 表示服务能够响应，不代表上游数据完整或新鲜。`/api/monitor` 提供采集错误、更新时刻及补录状态。首次同步尚未保存钱包快照时，钱包接口会返回 `503 initial_sync`；后台继续同步，页面会重试。
 
 ## SSH 本地预览
 
@@ -82,7 +82,7 @@ docker compose up -d
 
 `latest` 会随发布变化；需要固定版本时，将 Compose 中的镜像引用改为已发布的版本标签或镜像摘要。
 
-备份前暂停采集，并通过容器复制数据库：
+备份前暂停采集，并通过容器复制数据库；复制命令见 [Docker 官方说明](https://docs.docker.com/reference/cli/docker/compose/cp/)：
 
 ```sh
 docker compose stop dashboard
