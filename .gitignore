@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env*
+!.env.example
+*.log
+test-results/
+playwright-report/
+*.tsbuildinfo
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.npmrc
+docs/*
+!docs/deployment-public.md

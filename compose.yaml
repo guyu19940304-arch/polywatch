@@ -1,0 +1,35 @@
+name: polywatch
+services:
+  dashboard:
+    image: ghcr.io/guyu19940304-arch/polywatch:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${PORT:-8787}:8787"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      MONITOR_ENABLED: "true"
+      DATABASE_PATH: /data/polywatch.sqlite
+      WATCH_WALLETS: "${WATCH_WALLETS:?Set WATCH_WALLETS in .env}"
+      RETENTION_DAYS: 30
+      ACTIVITY_INTERVAL_MS: 5000
+      SNAPSHOT_INTERVAL_MS: 60000
+    volumes:
+      - polywatch-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+volumes:
+  polywatch-data:

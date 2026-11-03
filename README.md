@@ -1,0 +1,80 @@
+# Polywatch
+
+Polymarket 公开钱包监控看板：查看盈亏、持仓、市场窗口和交易明细。基于 React、TypeScript、Node.js 与 SQLite，无需私钥或交易权限。
+
+- 支持多个钱包，切换 24h / 7day / 30day 盈亏，并显示历史累计。
+- 查看当前仓位及各市场窗口的全生命周期盈亏，支持 BTC 5m 窗口单独核验。
+- 后台默认每 5 秒采集交易、每 60 秒更新盈亏和持仓快照；页面支持交易分页。
+- 本地滚动保留 30 天历史，重启后恢复采集进度；上游异常时展示已保存的数据并标明异常。
+- 提供移动端布局与独立标识的演示数据。
+
+源码：[guyu19940304-arch/polywatch](https://github.com/guyu19940304-arch/polywatch) · 镜像：`ghcr.io/guyu19940304-arch/polywatch:latest`（仅 `linux/amd64`）
+
+## 本地运行
+
+使用 Node.js 24 LTS 的最新小版本及 npm。
+
+```sh
+git clone https://github.com/guyu19940304-arch/polywatch.git
+cd polywatch
+npm ci
+cp .env.example .env
+```
+
+编辑根目录 `.env`。模板默认关闭后台采集；填写钱包并改为 `true` 后启用：
+
+```dotenv
+MONITOR_ENABLED=true
+# 必填：1–10 个公开钱包地址，使用英文逗号分隔。
+WATCH_WALLETS=
+RETENTION_DAYS=30
+```
+
+在 `WATCH_WALLETS` 中填入实际地址。建议使用 Polymarket 个人资料对应的代理钱包地址；错误地址可能没有可用统计。不要填写私钥、助记词或登录凭据。
+
+`npm run dev` 和 `npm start` 会读取 `.env`。页面关注列表与服务端采集配置分别保存：在页面添加地址不会修改 `WATCH_WALLETS`；只有服务端配置的钱包会持续采集。修改 `.env` 后重启服务。
+
+开发预览：
+
+```sh
+npm run dev
+```
+
+访问 [http://127.0.0.1:5173](http://127.0.0.1:5173)。
+
+构建并运行：
+
+```sh
+npm test
+npm run build
+npm start
+```
+
+访问 [http://127.0.0.1:8787](http://127.0.0.1:8787)。默认只监听本机，数据库位于 `data/polywatch.sqlite`。后台采集需要服务进程持续运行；关闭浏览器不会停止已启用的采集进程。
+
+## Docker 部署
+
+镜像支持 Linux x86-64（`linux/amd64`）。准备好 `.env` 中的 `WATCH_WALLETS` 后：
+
+```sh
+docker compose pull
+docker compose up -d
+docker compose ps
+```
+
+Compose 固定启用后台采集，使用命名卷保存 SQLite，默认仅向服务器本机的 `127.0.0.1:8787` 开放。通过 SSH 转发即可在自己的电脑预览，详见 [部署与维护](docs/deployment-public.md)。
+
+## 数据口径与限制
+
+- **盈亏范围**：历史累计使用官方 `position_pnl = realized_pnl + unrealized_pnl`，包含官方汇总的单市场、组合持仓与 LP 盈亏，不含钱包奖励或返佣。手续费单独披露，不再重复扣除；持仓估值不包含可用现金。
+- **周期盈亏**：按官方历史观测的完整起止边界相减。实际区间、源精度和延迟以页面披露为准；边界或数值缺失时不按零补齐。官方小时网格可能由日频源生成，不能视为逐笔结算结果。
+- **市场窗口**：按 `conditionId` 合并仓位，显示该窗口全生命周期盈亏，不是所选 24h / 7day / 30day 的增量。单市场列表不覆盖全部组合或 LP 数据，不能用窗口合计替代账户统计。
+- **更新与历史**：5 秒 / 60 秒是默认采集间隔，不是链上推送保证。上游索引延迟、限流、网络失败和重试退避都会增加延迟。首次启动逐页补录公开 API 可提供的最近 30 天记录；分页完成不等于链上逐笔审计完整。
+- **保留范围**：交易、已关闭仓位/窗口及历史曲线滚动保留 30 天；当前仓位、最新官方累计和周期摘要单独保留。官方累计仍可能覆盖更久历史。缺口、部分加载和旧快照会标注，不保证取得所有历史交易。
+- **提醒**：目前只有页面内状态和大额成交提示，没有外部通知推送。
+
+项目读取公开 API，未与 Polymarket 官方关联。页面没有登录或访问控制；如需公网访问，请自行配置认证与 HTTPS。
+
+## 许可证
+
+[MIT](LICENSE)

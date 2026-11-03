@@ -1,0 +1,20 @@
+{
+  "name": "polywatch-dashboard",
+  "version": "1.0.0",
+  "description": "A self-hosted Polymarket wallet PnL and trade monitoring dashboard",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/guyu19940304-arch/polywatch.git" },
+  "engines": { "node": ">=24" },
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/run.mjs",
+    "dev:client": "vite --host 127.0.0.1",
+    "dev:server": "node --watch server/index.mjs",
+    "build": "tsc -b && vite build",
+    "start": "node scripts/run.mjs --production",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dependencies": {"react": "^19.2.0", "react-dom": "^19.2.0", "lucide-react": "^0.468.0", "recharts": "^3.0.0"},
+  "devDependencies": {"@types/react": "^19.2.0", "@types/react-dom": "^19.2.0", "@types/node": "^24.0.0", "@vitejs/plugin-react": "^5.0.0", "typescript": "^5.9.0", "vite": "^7.0.0", "@playwright/test": "^1.56.0"}
+}
