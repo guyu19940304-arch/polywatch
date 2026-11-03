@@ -1,75 +1,69 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { activityHealth, activityResponseState, appendActivityPage, decodeWallets, dueWallets, mergeActivityResponse, mergeActivityRows, mergeWalletRefresh, needsRangeFetch, normalizeMonitor, projectWalletRange, walletPollInterval, walletSettings, walletsFromMonitor } from '../src/useWallets.ts';
+import { createElement } from 'react';
+import { renderToString } from 'react-dom/server';
+import { activityHealth, activityResponseState, appendActivityPage, configurationFailure, dueWallets, mergeActivityResponse, mergeActivityRows, mergeWalletRefresh, needsRangeFetch, normalizeMonitor, projectWalletRange, retainConfigured, retireWalletAddresses, useWallets, walletPollInterval, walletsFromMonitor } from '../src/useWallets.ts';
 import { getDemoData, DEMO_WALLETS } from '../src/demo.ts';
 
-test('saved wallet decoding removes invalid and case-insensitive duplicate addresses', () => {
-  const wallet = '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd';
-  const result = decodeWallets(JSON.stringify([
-    { address: wallet, label: ' My wallet ' },
-    { address: `0x${wallet.slice(2).toUpperCase()}`, label: 'Duplicate' },
-    { address: 'https://untrusted.example/' },
-    null,
-  ]));
-  assert.equal(result.length, 1);
-  assert.equal(result[0].address, wallet);
-  assert.equal(result[0].label, 'My wallet');
-});
-
-test('empty saved wallets are respected and damaged settings are not silently accepted', () => {
-  assert.deepEqual(decodeWallets('[]'), []);
-  for (const value of ['null', '{}', 'oops', '[{"address":"bad"}]']) {
-    assert.throws(() => decodeWallets(value));
+test('initial hook rendering ignores old browser wallet settings and exposes no mutation API', () => {
+  const original = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  let storageReads = 0;
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { storageReads++; return { getItem: () => JSON.stringify([{ address: `0x${'91'.repeat(20)}`, label: 'Old browser wallet' }]) }; } });
+  try {
+    let model;
+    function Probe() { model = useWallets(); return null; }
+    renderToString(createElement(Probe));
+    assert.equal(storageReads, 0);
+    assert.deepEqual(model.wallets, []);
+    assert.deepEqual(model.entries, []);
+    assert.equal(model.isDemo, false);
+    assert.equal(model.configurationLoading, true);
+    assert.equal(model.configurationError, null);
+    for (const removed of ['addWallet', 'removeWallet', 'storageError']) assert.equal(removed in model, false);
+  } finally {
+    if (original) Object.defineProperty(globalThis, 'localStorage', original);
+    else delete globalThis.localStorage;
   }
 });
 
-test('wallet persistence applies the ten-wallet limit and safe labels', () => {
-  const result = decodeWallets(JSON.stringify(Array.from({ length: 12 }, (_, index) => ({
-    address: `0x${index.toString(16).padStart(40, '0')}`, label: 'a'.repeat(100), color: 'url(untrusted)',
-  }))));
-  assert.equal(result.length, 10);
-  assert.equal(result[0].label.length, 32);
-  assert.ok(result.every(wallet => /^#[0-9a-f]{6}$/.test(wallet.color)));
-});
-
-test('a clean browser starts in demo while an explicitly saved empty list is a preserved choice', () => {
-  const clean = walletSettings(null);
-  const explicitDemo = walletSettings('[]');
-  assert.deepEqual(clean.wallets, []);
-  assert.equal(clean.hasSavedSettings, false);
-  assert.deepEqual(explicitDemo.wallets, []);
-  assert.equal(explicitDemo.hasSavedSettings, true);
-});
-
-test('only an enabled available monitor can initialize an unsaved wallet list', () => {
-  const address = `0x${'12'.repeat(20)}`;
-  const monitor = normalizeMonitor({ enabled: true, addresses: [address] });
-  const wallets = walletsFromMonitor(monitor, false, []);
+test('deployment addresses remain readable when the collector is disabled', () => {
+  const address = `0x${'ab'.repeat(20)}`;
+  const monitor = normalizeMonitor({ enabled: false, addresses: [address, `0x${address.slice(2).toUpperCase()}`] });
+  const wallets = walletsFromMonitor(monitor);
+  assert.equal(wallets.length, 1);
   assert.equal(wallets[0].address, address);
-  assert.equal(wallets[0].label, '监控钱包 1');
-  assert.equal(walletsFromMonitor({ ...monitor, enabled: false }, false, []), null);
-  assert.equal(walletsFromMonitor({ ...monitor, available: false }, false, []), null);
-  assert.equal(walletsFromMonitor({ ...monitor, addresses: [] }, false, []), null);
+  assert.equal(walletPollInterval(address, monitor), 15000);
+  assert.deepEqual(walletsFromMonitor(normalizeMonitor({ enabled: true, addresses: [] })), []);
 });
 
-test('monitor responses preserve explicit demo, custom settings and changes made while loading', () => {
-  const monitor = normalizeMonitor({ enabled: true, addresses: [`0x${'12'.repeat(20)}`] });
-  const custom = walletSettings(JSON.stringify([{ address: `0x${'34'.repeat(20)}`, label: 'Custom' }]));
-  assert.equal(walletsFromMonitor(monitor, true, []), null, 'explicit [] must stay in demo');
-  assert.equal(walletsFromMonitor(monitor, custom.hasSavedSettings, custom.wallets), null);
-  assert.equal(walletsFromMonitor(monitor, false, custom.wallets), null, 'an in-flight response cannot replace a current nonempty choice');
-  const first = walletsFromMonitor(monitor, false, []);
-  const saved = walletSettings(JSON.stringify(first));
-  const changedMonitor = { ...monitor, addresses: [`0x${'56'.repeat(20)}`] };
-  assert.equal(walletsFromMonitor(changedMonitor, saved.hasSavedSettings, saved.wallets), null, 'periodic status updates must not reinitialize the list');
+test('configuration failure never substitutes demo or arbitrary wallets and retains known deployment addresses', () => {
+  const empty = normalizeMonitor({ enabled: false, addresses: [] });
+  const initialFailure = configurationFailure(empty);
+  assert.deepEqual(walletsFromMonitor(initialFailure), []);
+  assert.equal(initialFailure.loading, false);
+  assert.equal(initialFailure.available, false);
+  assert.ok(initialFailure.error.includes('无法读取部署者钱包配置'));
+  const previous = normalizeMonitor({ enabled: true, addresses: [`0x${'12'.repeat(20)}`] });
+  const failed = configurationFailure(previous);
+  assert.deepEqual(failed.addresses, previous.addresses);
+  assert.ok(failed.error.includes('暂保留上次配置'));
+  for (const addresses of [null, undefined, ['bad'], [7]]) assert.throws(() => normalizeMonitor({ enabled: true, addresses }));
 });
 
-test('monitor initialization respects the same ten-wallet cap as manual configuration', () => {
-  const addresses = Array.from({ length: 12 }, (_, index) => `0x${(index + 1).toString(16).padStart(40, '0')}`);
-  const monitor = normalizeMonitor({ enabled: true, addresses });
-  const wallets = walletsFromMonitor(monitor, false, []);
-  assert.equal(wallets.length, 10);
-  assert.equal(wallets[9].label, '监控钱包 10');
+test('deployment revocation aborts all request kinds and removes their data, timers and cursors', () => {
+  const revoked = `0x${'12'.repeat(20)}`, retained = `0x${'34'.repeat(20)}`;
+  const requests = Array.from({ length: 3 }, () => new Map([[revoked, new AbortController()], [retained, new AbortController()]]));
+  const revokedControllers = requests.map(pending => pending.get(revoked));
+  const caches = Array.from({ length: 5 }, (_, index) => new Map([[revoked, index], [retained, index]]));
+  retireWalletAddresses([revoked], requests, caches);
+  assert.ok(revokedControllers.every(controller => controller.signal.aborted));
+  assert.ok(requests.every(pending => !pending.has(revoked) && !pending.get(retained).signal.aborted));
+  assert.ok(caches.every(cache => !cache.has(revoked) && cache.has(retained)));
+  const data = { [revoked]: { pnl: 100 }, [retained]: { pnl: 200 } };
+  assert.deepEqual(retainConfigured(data, new Set([retained])), { [retained]: { pnl: 200 } });
+  assert.deepEqual(retainConfigured(data, new Set()), {});
+  const changed = normalizeMonitor({ enabled: true, addresses: [retained] });
+  assert.deepEqual(dueWallets(walletsFromMonitor(changed), changed, new Map(), new Set(), 1000).map(wallet => wallet.address), [retained]);
 });
 
 test('demo data stays explicitly marked and its holdings and totals reconcile', () => {
@@ -158,7 +152,7 @@ test('a complete fresh activity response replaces older rows and failed activity
 test('monitor supports both status shapes and applies cadence only to configured wallets', () => {
   const watched = DEMO_WALLETS[0].address;
   const unconfigured = DEMO_WALLETS[1].address;
-  const nested = normalizeMonitor({ enabled: true, retentionDays: 30, addresses: [watched, watched, 'bad'], intervals: { activityMs: 5000, snapshotMs: 60000 }, wallets: [{ address: watched, activityAt: 123456, backfill: { complete: false, pages: 3 } }] });
+  const nested = normalizeMonitor({ enabled: true, retentionDays: 30, addresses: [watched, watched], intervals: { activityMs: 5000, snapshotMs: 60000 }, wallets: [{ address: watched, activityAt: 123456, backfill: { complete: false, pages: 3 } }] });
   const flat = normalizeMonitor({ enabled: true, retentionDays: 30, addresses: [watched], activityIntervalMs: 5000, snapshotIntervalMs: 60000 });
   assert.deepEqual(nested.addresses, [watched]);
   assert.equal(nested.wallets[0].activityAt, 123456, 'collector status keeps millisecond timestamps');

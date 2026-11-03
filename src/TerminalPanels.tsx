@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
-import { Activity, ArrowUpRight, Check, Clock3, Copy, LoaderCircle, Plus, Star, Trash2, TriangleAlert, WifiOff } from 'lucide-react';
+import { Activity, ArrowUpRight, Check, Clock3, Copy, LoaderCircle, Star, TriangleAlert, WifiOff } from 'lucide-react';
 import type { Range, WalletEntry } from './types';
 import type { TradeRow } from './TradingTable';
 import { dateTime, marketUrl, money, number, short } from './format';
@@ -14,23 +14,21 @@ export interface WalletWatchlistProps {
   entries: WalletEntry[];
   selected: string;
   onSelect: (address: string) => void;
-  onAdd: () => void;
-  onRemove: (address: string) => void;
   onCopy: (address: string) => void;
   range: Range;
+  emptyMessage?: string;
 }
 
-export function WalletWatchlist({ entries, selected, onSelect, onAdd, onRemove, onCopy, range }: WalletWatchlistProps) {
+export function WalletWatchlist({ entries, selected, onSelect, onCopy, range, emptyMessage = '部署者尚未配置监控钱包' }: WalletWatchlistProps) {
   const headingId = useId();
   return <section className="tp-panel watch-panel" aria-labelledby={headingId}>
     <header className="tp-heading watch-heading">
-      <h2 id={headingId}>钱包观察列表 <span>Polymarket</span></h2>
+      <h2 id={headingId}>监控钱包 <span>Polymarket</span></h2>
       <div className="watch-toolbar">
-        <button className={`tp-text-button ${selected === 'all' ? 'watch-all-selected' : ''}`} aria-pressed={selected === 'all'} onClick={() => onSelect('all')}>全部钱包</button>
-        <button className="tp-icon-button" onClick={onAdd} title="添加钱包" aria-label="添加关注钱包"><Plus size={15}/></button>
+        <button className={`tp-text-button ${selected === 'all' ? 'watch-all-selected' : ''}`} aria-pressed={selected === 'all'} onClick={() => onSelect('all')} disabled={!entries.length}>全部钱包</button>
       </div>
     </header>
-    <div className="watch-scroll">
+    {entries.length > 0 && <div className="watch-scroll">
       <table className="watch-table">
         <thead><tr><th scope="col">钱包 / 地址</th><th scope="col" className="tp-numeric">周期 PnL <span>({RANGE_NAMES[range]})</span></th><th scope="col" className="tp-numeric">持仓市值</th><th scope="col"><span className="tp-sr-only">钱包操作</span></th></tr></thead>
         <tbody>{entries.map(entry => {
@@ -38,22 +36,21 @@ export function WalletWatchlist({ entries, selected, onSelect, onAdd, onRemove, 
           const name = walletName(entry);
           const pnl = data?.range === range && data.period?.complete ? data.period.totalPnl : null;
           const isSelected = selected === wallet.address;
-          const demo = data?.source === 'demo';
           return <tr key={wallet.address} className={isSelected ? 'watch-row-selected' : ''} onClick={() => onSelect(wallet.address)}>
-            <td><button className="watch-wallet-button" onClick={event => { event.stopPropagation(); onSelect(wallet.address); }} aria-pressed={isSelected} title={`${name} · ${wallet.address}`}>
+            <td><button className="watch-wallet-button" onClick={event => { event.stopPropagation(); onSelect(wallet.address); }} aria-pressed={isSelected} aria-label={`查看 ${name}`} title={`${name} · ${wallet.address}`}>
               <Star size={15} className="watch-star" fill={isSelected ? 'currentColor' : 'none'}/>
-              <span className="watch-wallet-name">{name}{demo && <span className="watch-demo">示例</span>}</span>
+              <span className="watch-wallet-name">{name}</span>
               <span className="watch-address">{short(wallet.address)}</span>
               {(entry.error || entry.stale || data?.period?.stale) && <TriangleAlert className="watch-warning" size={12} aria-label="数据可能延迟"/>}
             </button></td>
             <td className={`tp-numeric watch-pnl ${valueClass(pnl)}`} title={entry.loading && !data ? '正在获取数据' : data?.period?.reason || undefined}>{entry.loading && !data ? <span className="watch-loading">同步中</span> : money(pnl, true)}</td>
             <td className="tp-numeric watch-value">{money(data?.summary.positionValue)}</td>
-            <td className="watch-actions"><button className="tp-icon-button" title={`复制 ${name} 地址`} aria-label={`复制 ${name} 地址`} onClick={event => { event.stopPropagation(); onCopy(wallet.address); }}><Copy size={12}/></button>{!demo && <button className="tp-icon-button watch-remove" title={`移除 ${name}`} aria-label={`移除 ${name}`} onClick={event => { event.stopPropagation(); onRemove(wallet.address); }}><Trash2 size={12}/></button>}</td>
+            <td className="watch-actions"><button className="tp-icon-button" title={`复制 ${name} 地址`} aria-label={`复制 ${name} 地址`} onClick={event => { event.stopPropagation(); onCopy(wallet.address); }}><Copy size={12}/></button></td>
           </tr>;
         })}</tbody>
       </table>
-    </div>
-    {!entries.length && <div className="tp-empty watch-empty"><span>添加钱包，开始读取公开交易与盈亏。</span><button className="tp-text-button" onClick={onAdd}><Plus size={13}/>添加钱包</button></div>}
+    </div>}
+    {!entries.length && <div className="tp-empty watch-empty"><strong>{emptyMessage}</strong><span>钱包由部署者指定，页面仅供查看。</span></div>}
   </section>;
 }
 

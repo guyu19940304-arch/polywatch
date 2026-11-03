@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { DEMO_WALLETS, getDemoData } from './demo.ts';
 import type { Activity, ActivityMonitor, ActivityResponse, HistoryPoint, MarketWindow, MonitorStatus, MonitorWallet, Period, Position, Range, WalletConfig, WalletData, WalletEntry, WalletState } from './types';
 
-const STORAGE_KEY = 'polywatch.wallets.v1';
 const ADDRESS = /^0x[0-9a-fA-F]{40}$/;
 const COLORS = ['#d7efea', '#e5e2f7', '#f4ead7', '#dceaf5', '#f5e1e9'];
 const EMPTY_STATE: WalletState = { loading: false, stale: false, error: null, loadingMore: false };
@@ -11,6 +9,7 @@ const DEFAULT_MONITOR: MonitorStatus = { loading: true, available: false, enable
 export function normalizeMonitor(payload: unknown): MonitorStatus {
   if (!payload || typeof payload !== 'object' || !('enabled' in payload) || typeof payload.enabled !== 'boolean') throw new Error('后台监控状态格式无效');
   const raw = payload as Record<string, unknown>;
+  if (!Array.isArray(raw.addresses) || raw.addresses.some(value => typeof value !== 'string' || !ADDRESS.test(value))) throw new Error('部署者钱包配置格式无效');
   const intervals = raw.intervals && typeof raw.intervals === 'object' ? raw.intervals as Record<string, unknown> : {};
   const finite = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? value : null;
   const text = (value: unknown) => typeof value === 'string' ? value : null;
@@ -62,42 +61,25 @@ export function needsRangeFetch(source: WalletData | undefined, range: Range, ca
   return range === 'all' || !source.periods?.[range] || source.historyAll === undefined;
 }
 
-export function decodeWallets(value: string): WalletConfig[] {
-  const parsed: unknown = JSON.parse(value);
-  if (!Array.isArray(parsed)) throw new Error('钱包列表格式无效');
-  const result: WalletConfig[] = [];
-  const seen = new Set<string>();
-  for (const candidate of parsed) {
-    if (!candidate || typeof candidate !== 'object' || typeof candidate.address !== 'string' || !ADDRESS.test(candidate.address)) continue;
-    const address = candidate.address.toLowerCase();
-    if (seen.has(address)) continue;
-    seen.add(address);
-    result.push({ address,
-      label: typeof candidate.label === 'string' ? candidate.label.trim().slice(0, 32) : '',
-      color: COLORS[result.length % COLORS.length],
-    });
-    if (result.length === 10) break;
-  }
-  if (parsed.length && !result.length) throw new Error('未找到有效钱包地址');
-  return result;
+export function walletsFromMonitor(monitor: MonitorStatus): WalletConfig[] {
+  // enabled controls the collector, not the deployer's read-only watch list.
+  return monitor.addresses.map((address, index) => ({ address, label: `监控钱包 ${index + 1}`, color: COLORS[index % COLORS.length] }));
 }
 
-export function walletSettings(saved: string | null) {
-  return { wallets: saved === null ? [] as WalletConfig[] : decodeWallets(saved), hasSavedSettings: saved !== null, error: null as string | null };
+export function configurationFailure(previous: MonitorStatus): MonitorStatus {
+  return { ...previous, loading: false, available: false, error: previous.addresses.length
+    ? '无法读取部署者钱包配置，暂保留上次配置；会自动重试。'
+    : '无法读取部署者钱包配置，请检查服务连接；会自动重试。' };
 }
 
-export function walletsFromMonitor(monitor: MonitorStatus, hasSavedSettings: boolean, currentWallets: WalletConfig[]): WalletConfig[] | null {
-  if (hasSavedSettings || currentWallets.length || !monitor.available || !monitor.enabled || !monitor.addresses.length) return null;
-  return monitor.addresses.slice(0, 10).map((address, index) => ({ address, label: `监控钱包 ${index + 1}`, color: COLORS[index % COLORS.length] }));
+export function retainConfigured<T>(record: Record<string, T>, addresses: ReadonlySet<string>): Record<string, T> {
+  return Object.fromEntries(Object.entries(record).filter(([address]) => addresses.has(address)));
 }
 
-function initialSettings() {
-  try {
-    return walletSettings(localStorage.getItem(STORAGE_KEY));
-  } catch {
-    // A blocked or malformed store is not evidence that the user has no saved
-    // settings. Keep the unknown settings intact instead of auto-replacing them.
-    return { wallets: [] as WalletConfig[], hasSavedSettings: true, error: '无法读取本地钱包列表，当前显示演示；本次修改可能无法保存。' };
+export function retireWalletAddresses(addresses: string[], requests: Map<string, AbortController>[], caches: { delete(key: string): boolean }[]) {
+  for (const address of addresses) {
+    for (const pending of requests) { pending.get(address)?.abort(); pending.delete(address); }
+    for (const cache of caches) cache.delete(address);
   }
 }
 
@@ -279,16 +261,14 @@ function snapshotFailed(data: WalletData | undefined): boolean {
 }
 
 export function useWallets() {
-  const [initial] = useState(initialSettings);
-  const [savedWallets, setSavedWallets] = useState<WalletConfig[]>(initial.wallets);
-  const [storageError, setStorageError] = useState<string | null>(initial.error);
+  const [configuredWallets, setConfiguredWallets] = useState<WalletConfig[]>([]);
   const [range, setRangeState] = useState<Range>('1d');
   const [monitor, setMonitor] = useState<MonitorStatus>(DEFAULT_MONITOR);
   const [liveData, setLiveData] = useState<Record<string, WalletData>>({});
   const [states, setStates] = useState<Record<string, WalletState>>({});
   const [lastUpdated, setLastUpdated] = useState<string | null>(null);
-  const configsRef = useRef(savedWallets);
-  const hasSavedSettings = useRef(initial.hasSavedSettings);
+  const configsRef = useRef(configuredWallets);
+  const configurationRefresh = useRef<() => Promise<void>>(async () => {});
   const rangeRef = useRef(range);
   const dataRef = useRef(liveData);
   const activeRequests = useRef(new Map<string, AbortController>());
@@ -302,7 +282,7 @@ export function useWallets() {
   const loadedCursors = useRef(new Map<string, Set<string>>());
   const generation = useRef(0);
   const alive = useRef(true);
-  configsRef.current = savedWallets;
+  configsRef.current = configuredWallets;
   rangeRef.current = range;
   dataRef.current = liveData;
   monitorRef.current = monitor;
@@ -327,49 +307,21 @@ export function useWallets() {
     setRangeState(next);
   }, [abortRequests]);
 
-  const persist = useCallback((wallets: WalletConfig[]) => {
-    // Set synchronously so an in-flight monitor response cannot override a user
-    // choice, even if browser persistence is unavailable in this session.
-    hasSavedSettings.current = true;
+  const applyConfiguration = useCallback((next: MonitorStatus) => {
+    const wallets = walletsFromMonitor(next);
+    const allowed = new Set(wallets.map(wallet => wallet.address));
+    const revoked = configsRef.current.filter(wallet => !allowed.has(wallet.address)).map(wallet => wallet.address);
     configsRef.current = wallets;
-    setSavedWallets(wallets);
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(wallets));
-      setStorageError(null);
-    } catch {
-      setStorageError('浏览器无法保存钱包列表；刷新页面后，本次修改可能丢失。');
+    retireWalletAddresses(revoked, [activeRequests.current, headRequests.current, moreRequests.current],
+      [loadedCursors.current, lastRequested.current, lastHeadRequested.current, headErrors.current, rangeCache.current]);
+    if (revoked.length) {
+      dataRef.current = retainConfigured(dataRef.current, allowed);
+      setLiveData(current => retainConfigured(current, allowed));
+      setStates(current => retainConfigured(current, allowed));
     }
+    if (!wallets.length) setLastUpdated(null);
+    setConfiguredWallets(current => current.length === wallets.length && current.every((wallet, index) => wallet.address === wallets[index].address) ? current : wallets);
   }, []);
-
-  const addWallet = useCallback((input: string, label = ''): string | null => {
-    const address = input.trim().toLowerCase();
-    if (!ADDRESS.test(address)) return '请输入 0x 开头的 42 位钱包地址。';
-    const current = configsRef.current;
-    if (current.some(wallet => wallet.address === address)) return '这个钱包已经在关注列表中。';
-    if (current.length >= 10) return '最多关注 10 个钱包，请先移除一个钱包。';
-    persist([...current, { address, label: label.trim().slice(0, 32), color: COLORS[current.length % COLORS.length] }]);
-    return null;
-  }, [persist]);
-
-  const removeWallet = useCallback((address: string) => {
-    const normalized = address.toLowerCase();
-    moreRequests.current.get(normalized)?.abort();
-    moreRequests.current.delete(normalized);
-    loadedCursors.current.delete(normalized);
-    activeRequests.current.get(normalized)?.abort();
-    activeRequests.current.delete(normalized);
-    headRequests.current.get(normalized)?.abort();
-    headRequests.current.delete(normalized);
-    lastRequested.current.delete(normalized);
-    lastHeadRequested.current.delete(normalized);
-    headErrors.current.delete(normalized);
-    rangeCache.current.delete(normalized);
-    persist(configsRef.current.filter(wallet => wallet.address !== normalized));
-    setLiveData(current => {
-      const next = { ...current }; delete next[normalized]; dataRef.current = next; return next;
-    });
-    setStates(current => { const next = { ...current }; delete next[normalized]; return next; });
-  }, [persist]);
 
   const runRequests = useCallback(async (force = false, ensureRange = false) => {
     if (!alive.current || document.hidden) return;
@@ -417,7 +369,7 @@ export function useWallets() {
     }));
   }, []);
 
-  const refresh = useCallback(() => runRequests(true), [runRequests]);
+  const refresh = useCallback(async () => { await configurationRefresh.current(); await runRequests(true); }, [runRequests]);
 
   const pollActivity = useCallback(async () => {
     const status = monitorRef.current;
@@ -507,7 +459,7 @@ export function useWallets() {
     }
   }, []);
 
-  const walletKey = savedWallets.map(wallet => wallet.address).join(',');
+  const walletKey = configuredWallets.map(wallet => wallet.address).join(',');
   useEffect(() => {
     alive.current = true;
     // Configuration changes cancel all old requests; clear their UI locks even
@@ -549,55 +501,37 @@ export function useWallets() {
         const next = normalizeMonitor(await requestJson('/api/monitor', request.signal, 8000));
         if (!disposed && !request.signal.aborted) {
           monitorRef.current = next; setMonitor(next);
-          const initialized = walletsFromMonitor(next, hasSavedSettings.current, configsRef.current);
-          if (initialized) persist(initialized);
+          applyConfiguration(next);
         }
       } catch {
         if (!disposed && !request.signal.aborted) {
-          const next = { ...DEFAULT_MONITOR, loading: false, error: '后台监控状态暂不可用，当前按普通模式刷新。' };
+          const next = configurationFailure(monitorRef.current);
           monitorRef.current = next; setMonitor(next);
         }
       } finally { if (controller === request) controller = null; }
     };
+    configurationRefresh.current = readStatus;
     void readStatus();
     const interval = setInterval(() => { void readStatus(); }, 30000);
     const visibility = () => { if (!document.hidden) void readStatus(); else { controller?.abort(); controller = null; } };
     document.addEventListener('visibilitychange', visibility);
-    return () => { disposed = true; controller?.abort(); clearInterval(interval); document.removeEventListener('visibilitychange', visibility); };
-  }, [persist]);
+    return () => { disposed = true; controller?.abort(); clearInterval(interval); document.removeEventListener('visibilitychange', visibility); if (configurationRefresh.current === readStatus) configurationRefresh.current = async () => {}; };
+  }, [applyConfiguration]);
 
-  useEffect(() => {
-    const sync = (event: StorageEvent) => {
-      if (event.key !== STORAGE_KEY) return;
-      try {
-        const settings = walletSettings(event.newValue);
-        hasSavedSettings.current = settings.hasSavedSettings;
-        configsRef.current = settings.wallets;
-        setSavedWallets(settings.wallets);
-        setStorageError(null);
-      } catch {
-        hasSavedSettings.current = true;
-        setStorageError('另一个标签页的钱包设置无效，当前列表已保留。');
-      }
-    };
-    window.addEventListener('storage', sync);
-    return () => window.removeEventListener('storage', sync);
-  }, []);
-
-  const isDemo = savedWallets.length === 0;
-  const demoData = useMemo(() => getDemoData(range), [range]);
-  const wallets = isDemo ? DEMO_WALLETS : savedWallets;
+  const isDemo = false;
+  const wallets = configuredWallets;
   const projectedData = useMemo(() => Object.fromEntries(Object.entries(liveData).map(([address, value]) => [address, projectWalletRange(value, range, rangeCache.current.get(address)?.[range])])), [liveData, range]);
-  const data = isDemo ? demoData : projectedData;
+  const data = projectedData;
   const entries: WalletEntry[] = wallets.map(wallet => {
     const value = data[wallet.address] || null;
     return {
-      wallet, ...(isDemo ? EMPTY_STATE : states[wallet.address] || EMPTY_STATE),
+      wallet, ...(states[wallet.address] || EMPTY_STATE),
       data: value,
     };
   });
-  return { wallets, entries, data, states, isDemo, range, setRange, storageError, monitor,
-    refreshing: !isDemo && entries.some(entry => entry.loading), lastUpdated: isDemo ? null : lastUpdated,
-    addWallet, removeWallet, refresh, loadMore,
+  return { wallets, entries, data, states, isDemo, range, setRange, monitor,
+    configurationLoading: monitor.loading, configurationError: monitor.error,
+    refreshing: entries.some(entry => entry.loading), lastUpdated,
+    refresh, loadMore,
   };
 }

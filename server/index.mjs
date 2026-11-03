@@ -25,18 +25,25 @@ export function monitorConfig(env = process.env) {
   const enabled = env.MONITOR_ENABLED === 'true';
   const interval = (name, fallback, min, max) => { const value = Number(env[name] || fallback); if (!Number.isInteger(value) || value < min || value > max) throw new Error(`${name} 必须为 ${min} 至 ${max} 毫秒。`); return value; };
   const addresses = [...new Set((env.WATCH_WALLETS || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean))];
-  if (enabled && (!addresses.length || addresses.length > 10 || addresses.some(address => !ADDRESS_PATTERN.test(address)))) throw new Error('WATCH_WALLETS 必须为1至10个有效钱包地址，以逗号分隔。');
+  if ((enabled && !addresses.length) || addresses.length > 10 || addresses.some(address => !ADDRESS_PATTERN.test(address))) throw new Error('WATCH_WALLETS 必须为1至10个有效钱包地址，以逗号分隔。');
   if (env.RETENTION_DAYS !== undefined && env.RETENTION_DAYS !== '30') throw new Error('此看板固定滚动保留30天，RETENTION_DAYS 请设为30。');
-  return { enabled, addresses: enabled ? addresses : [], retentionDays: 30,
+  return { enabled, addresses, retentionDays: 30,
     activityIntervalMs: interval('ACTIVITY_INTERVAL_MS', 5000, 3000, 60000),
     snapshotIntervalMs: interval('SNAPSHOT_INTERVAL_MS', 60000, 15000, 300000),
     databasePath: env.DATABASE_PATH || path.join(projectRoot, 'data', 'polywatch.sqlite') };
 }
 
-export function createServer({ client = createPolymarketClient(), distDir = path.join(projectRoot, 'dist'), store = null, monitor = null, now = Date.now } = {}) {
+export function createServer({ client = createPolymarketClient(), distDir = path.join(projectRoot, 'dist'), addresses = [], store = null, monitor = null, now = Date.now } = {}) {
+  const allowedAddresses = new Set(addresses.map(address => address.toLowerCase()));
+  const configuredAddress = value => {
+    const address = decodeURIComponent(value).toLowerCase();
+    if (!ADDRESS_PATTERN.test(address)) throw new ApiError('无效的钱包地址。', 400, 'invalid_address');
+    if (!allowedAddresses.has(address)) throw new ApiError('此钱包未由部署者配置。看板仅允许查看已配置的钱包。', 403, 'wallet_not_configured');
+    return address;
+  };
   const monitorStatus = () => {
     const status = monitor?.status() || { enabled: false, addresses: [], wallets: [], retentionDays: 30 };
-    return { ...status, activityIntervalMs: status.intervals?.activityMs ?? 5000, snapshotIntervalMs: status.intervals?.snapshotMs ?? 60000 };
+    return { ...status, addresses: [...allowedAddresses], wallets: status.wallets.filter(wallet => allowedAddresses.has(wallet.address.toLowerCase())), activityIntervalMs: status.intervals?.activityMs ?? 5000, snapshotIntervalMs: status.intervals?.snapshotMs ?? 60000 };
   };
   const monitored = address => store && monitorStatus().enabled && monitorStatus().addresses.includes(address.toLowerCase());
   const activityMeta = (address, status) => {
@@ -52,12 +59,11 @@ export function createServer({ client = createPolymarketClient(), distDir = path
       if (url.pathname === '/api/health') return json(response, 200, { status: 'ok', service: 'polymarket-wallet-monitor', version: 2, persistent: Boolean(store) });
       if (url.pathname === '/api/monitor') return json(response, 200, monitorStatus());
       const windowMatch = url.pathname.match(/^\/api\/wallet\/([^/]+)\/window\/([^/]+)$/);
-      if (windowMatch) return json(response, 200, await client.window(decodeURIComponent(windowMatch[1]), decodeURIComponent(windowMatch[2])));
+      if (windowMatch) return json(response, 200, await client.window(configuredAddress(windowMatch[1]), decodeURIComponent(windowMatch[2])));
       const match = url.pathname.match(/^\/api\/wallet\/([^/]+)(\/activity)?$/);
       if (match) {
-        const address = decodeURIComponent(match[1]);
+        const address = configuredAddress(match[1]);
         if (monitored(address)) {
-          if (!ADDRESS_PATTERN.test(address)) throw new ApiError('无效的钱包地址。', 400, 'invalid_address');
           if (match[2]) return json(response, 200, { ...store.readActivities(address, url.searchParams.get('cursor')), monitor: activityMeta(address, monitorStatus()) });
           const range = url.searchParams.get('range') || '1m';
           if (!['1d', '1w', '1m', 'all'].includes(range)) throw new ApiError('无效的统计周期。', 400, 'invalid_range');
@@ -119,7 +125,7 @@ export async function createRuntime({ env = process.env } = {}) {
     try { monitor = createMonitor({ client, store, addresses: config.addresses, activityIntervalMs: config.activityIntervalMs, snapshotIntervalMs: config.snapshotIntervalMs }); monitor.start(); }
     catch (error) { store.close(); throw error; }
   }
-  const server = createServer({ client, store, monitor });
+  const server = createServer({ client, store, monitor, addresses: config.addresses });
   let stopped = false;
   return { server, store, monitor, async stop() {
     if (stopped) return; stopped = true;

@@ -159,7 +159,7 @@ test('rate limit metadata is retained and malformed pagination is rejected', asy
 });
 
 test('HTTP routes expose health and validated API; unsupported methods and paths return proper status', async t => {
-  const server = createServer({ client: createPolymarketClient(fixture()) });
+  const server = createServer({ client: createPolymarketClient(fixture()), addresses: [ADDRESS] });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -292,7 +292,7 @@ test('single-window missing/partial/wrong-market results cannot masquerade as co
 
 test('HTTP single-window endpoint exposes validation and complete verified result', async t => {
   const client = createPolymarketClient(fixture({ '/v2/positions': () => response(page([{ ...position, condition_id: CONDITION }])) }));
-  const server = createServer({ client });
+  const server = createServer({ client, addresses: [ADDRESS] });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
   const base = `http://127.0.0.1:${server.address().port}/api/wallet/${ADDRESS}/window/`;
