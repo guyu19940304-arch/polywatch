@@ -8,32 +8,52 @@ const SECTION_NAMES = { stats: '盈亏统计', value: '持仓价值', history: '
 
 /** Preserve last-known successful sections, while keeping their error and age visible. */
 export function mergeCollectedSnapshot(next, previous) {
+  const statsBasis = value => value?.summary?.pnlBasis || value?.pnlBasis || 'polymarket-position-pnl';
+  const historyBasis = value => value?.historyPnlBasis || value?.pnlBasis || statsBasis(value);
+  const sameStatsBasis = previous && statsBasis(previous) === statsBasis(next);
+  const sameHistoryBasis = previous && historyBasis(previous) === historyBasis(next);
   const result = { ...next, summary: { ...next.summary }, sections: { ...next.sections },
     coverage: structuredClone(next.coverage || {}), sectionFetchedAt: { ...next.sectionFetchedAt },
     warnings: [...(next.warnings || [])] };
   for (const key of Object.keys(SECTION_NAMES)) {
     const failed = next.sections?.[key] === 'error';
-    const source = failed ? previous : next;
+    const source = failed ? (key === 'stats' && !sameStatsBasis || key === 'history' && !sameHistoryBasis ? null : previous) : next;
     result.sectionFetchedAt[key] = source?.sectionFetchedAt?.[key]
       ?? (key === 'positions' || key === 'closedPositions' ? source?.coverage?.[key]?.fetchedAt : key === 'activity' ? source?.activityFetchedAt : source?.fetchedAt)
       ?? null;
     if (failed) result.warnings.push(`${SECTION_NAMES[key]}刷新失败；${previous ? '保留可用的上次数据，原观测时间未更新。' : '尚无可用历史快照。'}`);
   }
-  if (previous && next.sections?.stats === 'error') {
+  if (sameStatsBasis && next.sections?.stats === 'error') {
     result.summary = { ...previous.summary, positionValue: next.summary?.positionValue ?? null };
+    result.pnlBasis = previous.summary?.pnlBasis || previous.pnlBasis || 'polymarket-position-pnl';
   }
   if (previous && next.sections?.value === 'error') result.summary.positionValue = previous.summary?.positionValue ?? null;
-  if (previous && next.sections?.history === 'error') {
+  if (previous && !sameStatsBasis && next.sections?.stats === 'error') {
+    result.summary = { ...result.summary, totalPnl: null, realizedPnl: null, unrealizedPnl: null };
+    result.warnings.push('盈亏口径升级中：新口径统计尚未成功，旧口径金额未用于回退。');
+  }
+  if (sameHistoryBasis && next.sections?.history === 'error') {
     result.historyAll = structuredClone(previous.historyAll || previous.history || []);
+    result.historyPnlBasis = previous.historyPnlBasis || previous.pnlBasis || previous.summary?.pnlBasis || 'polymarket-position-pnl';
+    result.historyByRange = structuredClone(previous.historyByRange || {});
     result.historySourceFidelity = previous.historySourceFidelity ?? null;
     const reason = '曲线接口刷新失败，保留原区间的历史快照，尚未重新核验。';
     const stalePeriod = period => period ? { ...period, complete: false, stale: true,
       reason: period.reason?.includes(reason) ? period.reason : [period.reason, reason].filter(Boolean).join('；') } : null;
     result.periods = Object.fromEntries(Object.entries(previous.periods || {}).map(([key, period]) => [key, stalePeriod(period)]));
     result.period = result.periods[next.range || '1m'] || stalePeriod(previous.period);
-    result.history = result.period && typeof result.period.start === 'number' && typeof result.period.end === 'number'
+    result.history = Array.isArray(result.historyByRange[next.range || '1m']) ? result.historyByRange[next.range || '1m']
+      : result.period && typeof result.period.start === 'number' && typeof result.period.end === 'number'
       ? result.historyAll.filter(point => timestamp(point) && point.timestamp >= result.period.start && point.timestamp <= result.period.end)
       : structuredClone(previous.history || []);
+  }
+  if (previous && !sameHistoryBasis && next.sections?.history === 'error') {
+    result.history = []; result.historyAll = []; result.historyByRange = {};
+    const unavailable = period => period ? { ...period, totalPnl: null, realizedPnl: null, unrealizedPnl: null, complete: false, stale: true,
+      reason: '盈亏口径升级中：新口径曲线尚未成功，旧口径曲线未用于回退。' } : null;
+    result.period = unavailable(next.period);
+    result.periods = Object.fromEntries(Object.entries(next.periods || {}).map(([key, period]) => [key, unavailable(period)]));
+    result.warnings.push('盈亏口径升级中：新口径曲线尚未成功，旧口径曲线未用于回退。');
   }
   let retainedBook = false;
   for (const key of ['positions', 'closedPositions']) {

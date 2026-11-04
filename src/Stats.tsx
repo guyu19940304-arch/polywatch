@@ -21,7 +21,7 @@ function Metric({ value, signed = true, primary = false }: { value: number | nul
 export function Stats({ summary, periodLabel, allPnl }: { summary: { totalPnl: number | null; realizedPnl: number | null }; periodLabel: string; allPnl: number | null }) {
   return <section className="stats-band panel" aria-label="盈亏统计">
     <div className="stats-heading"><h1>总盈亏 <span>PORTFOLIO P&L</span></h1><span className="stats-period">{periodLabel} / USD</span></div>
-    <div className="stats-main"><div className="stat-primary"><Metric value={summary.totalPnl} primary/><span className="stat-note">所选周期的仓位盈亏变化<ArrowUpRight size={13}/></span></div><div className="stat-secondary"><span className="stat-label">已实现盈亏变化</span><Metric value={summary.realizedPnl}/><span className="stat-note">Realized P&L Δ</span></div></div>
+    <div className="stats-main"><div className="stat-primary"><Metric value={summary.totalPnl} primary/><span className="stat-note">所选官网周期的交易盈亏变化<ArrowUpRight size={13}/></span></div><div className="stat-secondary"><span className="stat-label" title="官方净已实现仓位盈亏变化，与官网图表总额采用不同口径，不可作为其拆分项相加">已实现仓位盈亏变化</span><Metric value={summary.realizedPnl}/><span className="stat-note">Net realized P&L Δ</span></div></div>
     <div className="stats-bottom"><span>历史累计 <b className={tone(allPnl)}>{money(allPnl, true)}</b></span></div>
   </section>;
 }

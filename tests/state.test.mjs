@@ -95,6 +95,37 @@ test('demo selected-period gains follow the same boundary-difference rule as liv
 });
 
 const sample = getDemoData('1d')[DEMO_WALLETS[0].address];
+
+test('range switching uses the profile range grid instead of mixed all-history samples', () => {
+  const basis = 'polymarket-trade-pnl';
+  const weekly = [{ timestamp: 100, totalPnl: 10, realizedPnl: 1, unrealizedPnl: 0 }, { timestamp: 200, totalPnl: 30, realizedPnl: 2, unrealizedPnl: 0 }];
+  const source = { ...sample, pnlBasis: basis, historyPnlBasis: basis, summary: { ...sample.summary, pnlBasis: basis },
+    historyAll: [{ ...weekly[0], totalPnl: -999 }], historyByRange: { '1w': weekly },
+    periods: { ...sample.periods, '1w': { ...sample.periods['1w'], start: 100, end: 200, totalPnl: 20 } } };
+  const projected = projectWalletRange(source, '1w');
+  assert.deepEqual(projected.history, weekly);
+  assert.equal(projected.period.totalPnl, 20);
+  assert.equal(needsRangeFetch(source, '1w'), false);
+  assert.equal(projected.summary, source.summary);
+});
+
+test('a new PnL basis never resurrects old-basis stats, history or range cache on partial failure', () => {
+  const previous = { ...sample, fetchedAt: '2026-11-04T06:00:00Z' };
+  const basis = 'polymarket-trade-pnl';
+  const next = { ...sample, pnlBasis: basis, historyPnlBasis: basis, fetchedAt: '2026-11-04T05:00:00Z',
+    summary: { ...sample.summary, totalPnl: null, realizedPnl: null, unrealizedPnl: null, pnlBasis: basis },
+    history: [], historyAll: [], historyByRange: {}, periods: {}, period: { ...sample.period, totalPnl: null, complete: false },
+    sections: { ...sample.sections, stats: 'error', history: 'error' } };
+  const merged = mergeWalletRefresh(next, previous);
+  assert.equal(merged.summary.totalPnl, null);
+  assert.deepEqual(merged.history, []);
+  const cached = { ...previous, range: '1w' };
+  const projected = projectWalletRange(merged, '1w', cached);
+  assert.equal(projected.period.totalPnl, null);
+  assert.deepEqual(projected.history, []);
+  assert.equal(needsRangeFetch(merged, '1w', cached), true);
+});
+
 function trade(contentKey, id, timestamp = 100) {
   return { ...sample.activity[0], contentKey, id, timestamp };
 }

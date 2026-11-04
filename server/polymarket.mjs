@@ -4,6 +4,8 @@ const BASE_URL = 'https://data-api.polymarket.com';
 export const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 export const CONDITION_PATTERN = /^0x[0-9a-fA-F]{64}$/;
 const RANGES = new Set(['1d', '1w', '1m', 'all']);
+export const PNL_BASIS = 'polymarket-trade-pnl';
+const PROFILE_FIDELITIES = { '1d': '1h', '1w': '3h', '1m': '18h', all: '1d' };
 
 export class ApiError extends Error {
   constructor(message, status = 502, code = 'upstream_error', retryAfter = null) {
@@ -53,12 +55,35 @@ export function normalizeActivity(rows, pageKey = 'head') {
 
 export function normalizePnl(point) {
   return {
-    timestamp: numberOrNull(point?.timestamp), totalPnl: numberOrNull(point?.position_pnl),
+    timestamp: numberOrNull(point?.timestamp), totalPnl: numberOrNull(point?.trade_pnl),
     realizedPnl: numberOrNull(point?.realized_pnl), unrealizedPnl: numberOrNull(point?.unrealized_pnl),
   };
 }
 
 const PERIOD_SECONDS = { '1d': 86400, '1w': 7 * 86400, '1m': 30 * 86400 };
+
+export function pnlIsStale(observedAt, sourceFidelity, currentTime = Date.now() / 1000) {
+  const hours = { '1d': 48, '18h': 36, '12h': 24, '3h': 6, '1h': 2 }[sourceFidelity] || 2;
+  return numberOrNull(observedAt) !== null && currentTime - observedAt > hours * 3600;
+}
+
+// Match the profile's own interval/fidelity series. These are published chart
+// boundaries (e.g. 23 hours for a 24-point 1D chart), not exact rolling windows.
+export function calculateProfilePeriod(points, range, sourceFidelity = null, observedAt = null, currentTime = Date.now() / 1000) {
+  const ordered = points.filter(point => numberOrNull(point.timestamp) !== null).sort((a, b) => a.timestamp - b.timestamp);
+  const first = ordered[0];
+  const last = ordered.at(-1);
+  const validBounds = first && last && first.timestamp < last.timestamp;
+  const delta = key => validBounds && numberOrNull(first[key]) !== null && numberOrNull(last[key]) !== null ? last[key] - first[key] : null;
+  const totalPnl = delta('totalPnl');
+  const stale = pnlIsStale(observedAt ?? last?.timestamp, sourceFidelity, currentTime);
+  const reason = totalPnl === null ? '官方图表缺少有效起止盈亏值，暂不计算周期盈亏。'
+    : `与 Polymarket 个人页同口径，按所选周期图表首尾值相减；实际区间以起止时间为准。${sourceFidelity === '1d' ? '官方历史源为日频，细网格不代表逐小时新观测。' : ''}`;
+  return { range, start: first?.timestamp ?? null, end: last?.timestamp ?? null,
+    totalPnl, realizedPnl: delta('realizedPnl'), unrealizedPnl: delta('unrealizedPnl'),
+    complete: totalPnl !== null, reason: reason + (stale ? '官方源观测已超过其更新频率的宽限期。' : ''),
+    sourceFidelity, observedAt, stale, pnlBasis: PNL_BASIS };
+}
 
 // The interval endpoints omit their left boundary. Use a wider series and exact
 // matching timestamps; never silently call a 23-hour first/last delta "24 hours".
@@ -74,12 +99,12 @@ export function calculatePeriod(points, range, sourceFidelity = null, observedAt
   const result = { range, start, end: endPoint?.timestamp ?? null,
     totalPnl: delta('totalPnl'), realizedPnl: delta('realizedPnl'), unrealizedPnl: delta('unrealizedPnl'),
     complete: false, reason: null, sourceFidelity, observedAt,
-    stale: endPoint ? currentTime - Math.min(observedAt ?? endPoint.timestamp, endPoint.timestamp) > 7200 : false };
+    stale: endPoint ? pnlIsStale(Math.min(observedAt ?? endPoint.timestamp, endPoint.timestamp), sourceFidelity, currentTime) : false };
   result.complete = [result.totalPnl, result.realizedPnl, result.unrealizedPnl].every(value => value !== null);
   result.reason = !base ? '官方历史数据未覆盖该周期的完整起止边界，暂不计算周期盈亏。'
     : !result.complete ? '该周期边界存在未发布的盈亏数值，缺失部分不按零计算。'
       : sourceFidelity === '1d' ? '按官方小时网格起止值相减；官方声明历史源为日频，非逐笔结算值。' : null;
-  if (result.stale) result.reason = `${result.reason || ''}官方盈亏观测已超过 2 小时未更新，周期截至已发布的历史边界。`;
+  if (result.stale) result.reason = `${result.reason || ''}官方源观测已超过其更新频率的宽限期，周期截至已发布的历史边界。`;
   return result;
 }
 
@@ -160,7 +185,7 @@ export function createPolymarketClient({ fetchImpl = globalThis.fetch, now = Dat
       payload = await response.json();
     } catch (error) {
       if (error instanceof ApiError) throw error;
-      throw new ApiError('无法连接 Polymarket 数据服务，请检查网络或代理后重试。', 502, 'upstream_unavailable');
+      throw new ApiError('无法连接 Polymarket 数据服务，请检查网络或代理后重试。', 502, error?.name === 'TimeoutError' ? 'upstream_timeout' : 'upstream_unavailable');
     }
     if (!payload || typeof payload !== 'object' || !('data' in payload)) throw new ApiError('Polymarket 返回了无法识别的数据格式。', 502, 'invalid_upstream_data');
     return payload;
@@ -178,9 +203,10 @@ export function createPolymarketClient({ fetchImpl = globalThis.fetch, now = Dat
       let cursor;
       let complete = false;
       let error = null;
+      let reason = null;
       let fetchedPages = 0;
       for (let pageIndex = 0; pageIndex < maxPositionPages; pageIndex++) {
-        if (pageIndex > 0 && now() - started >= positionWalkTimeout) break;
+        if (pageIndex > 0 && now() - started >= positionWalkTimeout) { reason = '已达到本次历史加载时间上限。'; break; }
         try {
           const page = await request('/v2/positions', {
             user: address, condition, status, limit: positionPageSize, cursor,
@@ -200,13 +226,12 @@ export function createPolymarketClient({ fetchImpl = globalThis.fetch, now = Dat
           cursor = paging.nextCursor;
         } catch (failure) {
           if (!fetchedPages) throw failure;
-          error = now() - started >= positionWalkTimeout - 50
-            ? '已达到本次历史加载时间上限。'
-            : failure.message;
+          if (failure.code === 'upstream_timeout' && now() - started >= positionWalkTimeout - 50) reason = '已达到本次历史加载时间上限。';
+          else error = failure.message;
           break;
         }
       }
-      return { rows: [...rows.values()], complete, error, fetchedAt: isoNow() };
+      return { rows: [...rows.values()], complete, error, reason, fetchedAt: isoNow() };
   }
 
   async function positions(address, status, condition) {
@@ -249,11 +274,11 @@ export function createPolymarketClient({ fetchImpl = globalThis.fetch, now = Dat
       const key = keys[index];
       if (result.status === 'fulfilled') {
         data[key] = result.value.rows.map(normalizePosition);
-        coverage[key] = { complete: result.value.complete, count: result.value.rows.length, fetchedAt: result.value.fetchedAt };
-        if (!result.value.complete) warnings.push(`${key === 'positions' ? '当前' : '历史'}持仓尚未完整加载，窗口盈亏仍待核验。${result.value.error || ''}`);
+        coverage[key] = { complete: result.value.complete, count: result.value.rows.length, fetchedAt: result.value.fetchedAt, error: result.value.error };
+        if (!result.value.complete) warnings.push(`${key === 'positions' ? '当前' : '历史'}持仓尚未完整加载，窗口盈亏仍待核验。${result.value.error || result.value.reason || ''}`);
       } else {
         data[key] = [];
-        coverage[key] = { complete: false, count: 0, fetchedAt: null };
+        coverage[key] = { complete: false, count: 0, fetchedAt: null, error: result.reason.message };
         warnings.push(`${key === 'positions' ? '当前' : '历史'}持仓核验失败：${result.reason.message}`);
       }
     });
@@ -269,7 +294,11 @@ export function createPolymarketClient({ fetchImpl = globalThis.fetch, now = Dat
     const keys = ['stats', 'history', 'value', 'positions', 'closedPositions', 'activity'];
     const results = await Promise.allSettled([
       cached(`stats:${address}`, snapshotTtl, () => request('/v2/user-stats', { user: address })),
-      cached(`history:${address}`, snapshotTtl, () => request('/v2/user-pnl', { user: address, interval: 'all', fidelity: '1h' })),
+      cached(`history:${address}`, snapshotTtl, async () => Object.fromEntries(await Promise.all(Object.entries(PROFILE_FIDELITIES).map(async ([interval, fidelity]) => {
+        const result = await request('/v2/user-pnl', { user: address, interval, fidelity });
+        if (!Array.isArray(result.data?.points)) throw new ApiError('Polymarket 返回了无法识别的盈亏曲线。', 502, 'invalid_upstream_data');
+        return [interval, result.data];
+      })))),
       cached(`value:${address}`, snapshotTtl, () => request('/v2/value', { user: address })),
       positions(address, 'OPEN'), positions(address, 'CLOSED'), activity(address),
     ]);
@@ -277,44 +306,45 @@ export function createPolymarketClient({ fetchImpl = globalThis.fetch, now = Dat
     const data = {};
     const warnings = [];
     const sections = {};
+    const sectionErrors = {};
     const sectionLabels = { stats: '盈亏统计', history: '盈亏曲线', value: '持仓价值', positions: '当前持仓', closedPositions: '历史持仓', activity: '交易明细' };
     results.forEach((result, index) => {
       const key = keys[index];
       sections[key] = result.status === 'fulfilled' ? 'ok' : 'error';
       if (result.status === 'fulfilled') data[key] = result.value;
-      else warnings.push(`${sectionLabels[key]}：${result.reason.message}`);
+      else { sectionErrors[key] = result.reason.message; warnings.push(`${sectionLabels[key]}：${result.reason.message}`); }
     });
     if (data.stats && data.stats.data === null) warnings.push('该地址暂无公开用户统计。请确认输入的是 Polymarket 个人资料中的代理钱包地址。');
     const point = data.stats?.data?.all_time_pnl;
     if (data.stats?.data && !point) warnings.push('Polymarket 尚未发布该钱包的盈亏观测值。');
     const coverage = {};
     for (const key of ['positions', 'closedPositions']) {
-      coverage[key] = { complete: data[key]?.complete ?? false, count: data[key]?.rows.length ?? 0, fetchedAt: data[key]?.fetchedAt ?? null };
-      if (data[key] && !data[key].complete) warnings.push(`${sectionLabels[key]}只加载了 ${data[key].rows.length} 条，列表不完整；顶部盈亏来自官方全历史统计，不由此列表累加。${data[key].error || ''}`);
+      coverage[key] = { complete: data[key]?.complete ?? false, count: data[key]?.rows.length ?? 0, fetchedAt: data[key]?.fetchedAt ?? null, error: data[key]?.error || sectionErrors[key] || null };
+      if (data[key] && !data[key].complete) warnings.push(`${sectionLabels[key]}只加载了 ${data[key].rows.length} 条，列表不完整；顶部盈亏来自官方全历史统计，不由此列表累加。${data[key].error || data[key].reason || ''}`);
     }
     const summary = {
-      totalPnl: numberOrNull(point?.position_pnl), realizedPnl: numberOrNull(point?.realized_pnl),
+      totalPnl: numberOrNull(point?.trade_pnl), realizedPnl: numberOrNull(point?.realized_pnl),
       unrealizedPnl: numberOrNull(point?.unrealized_pnl), positionValue: numberOrNull(data.value?.data?.value),
       volume: numberOrNull(point?.volume_usdc), tradeCount: numberOrNull(point?.trade_count),
       observedAt: numberOrNull(point?.timestamp), economicPnl: numberOrNull(point?.economic_pnl),
-      walletIncome: numberOrNull(point?.wallet_income), feesPaid: numberOrNull(point?.fees_paid), source: 'polymarket-v2',
+      walletIncome: numberOrNull(point?.wallet_income), feesPaid: numberOrNull(point?.fees_paid), source: 'polymarket-v2', pnlBasis: PNL_BASIS,
     };
     const profileRow = data.positions?.rows.find(row => row.name) || data.closedPositions?.rows.find(row => row.name);
-    const allHistory = Array.isArray(data.history?.data?.points) ? data.history.data.points.map(normalizePnl) : [];
-    const sourceFidelity = data.history?.data?.source_fidelity ?? null;
-    const periods = Object.fromEntries(Object.keys(PERIOD_SECONDS).map(key => [key, calculatePeriod(allHistory, key, sourceFidelity, summary.observedAt, now() / 1000)]));
+    const historyByRange = Object.fromEntries(Object.keys(PROFILE_FIDELITIES).map(key => [key, (data.history?.[key]?.points || []).map(normalizePnl)]));
+    const sourceFidelity = data.history?.[range]?.source_fidelity ?? null;
+    const periods = Object.fromEntries(Object.keys(PERIOD_SECONDS).map(key => [key, calculateProfilePeriod(historyByRange[key], key, data.history?.[key]?.source_fidelity ?? null, summary.observedAt, now() / 1000)]));
     const period = range === 'all' ? { range, start: null, end: summary.observedAt,
       totalPnl: summary.totalPnl, realizedPnl: summary.realizedPnl, unrealizedPnl: summary.unrealizedPnl,
-      complete: [summary.totalPnl, summary.realizedPnl, summary.unrealizedPnl].every(value => value !== null),
-      reason: '全历史累计盈亏；不以最早可见观测值作为零基线。', sourceFidelity, observedAt: summary.observedAt,
-      stale: summary.observedAt !== null && now() / 1000 - summary.observedAt > 7200 } : periods[range];
+      complete: summary.totalPnl !== null,
+      reason: '全历史采用官方个人页 trade_pnl 累计值；不以最早可见观测值作为零基线。', sourceFidelity, observedAt: summary.observedAt, pnlBasis: PNL_BASIS,
+      stale: pnlIsStale(summary.observedAt, sourceFidelity, now() / 1000) } : periods[range];
     const openRows = (data.positions?.rows || []).map(normalizePosition);
     const closedRows = (data.closedPositions?.rows || []).map(normalizePosition);
     return {
-      address, fetchedAt: isoNow(), source: 'live', range,
+      address, fetchedAt: isoNow(), source: 'live', range, pnlBasis: PNL_BASIS, historyPnlBasis: PNL_BASIS,
       profile: data.activity?.profile || { name: text(profileRow?.name), avatar: text(profileRow?.profile_image) },
       summary, period, periods,
-      history: range === 'all' ? allHistory : allHistory.filter(point => point.timestamp !== null && point.timestamp >= period.start && point.timestamp <= period.end),
+      history: historyByRange[range], historyByRange, historyAll: historyByRange.all,
       historySourceFidelity: sourceFidelity,
       positions: openRows, closedPositions: closedRows,
       windows: aggregateWindows(openRows, closedRows, coverage.positions.complete && coverage.closedPositions.complete),
@@ -322,7 +352,7 @@ export function createPolymarketClient({ fetchImpl = globalThis.fetch, now = Dat
       activityPagination: data.activity?.pagination || { hasMore: false, nextCursor: null },
       activityFetchedAt: data.activity?.fetchedAt || null,
       coverage, sections, warnings,
-      methodology: '总盈亏采用官方 position_pnl = realized_pnl + unrealized_pnl，包含单市场、组合持仓与 LP 的已实现盈亏，不包含钱包奖励和返佣收入。24h/7day/30day 按官方小时网格完整边界相减，必须查看实际起止时间和源精度。每窗口按 conditionId 合并双方持仓的全生命周期盈亏，不是所选周期的增量。手续费仅披露，不重复扣除。持仓价值不含可用现金；单市场列表不覆盖组合持仓。',
+      methodology: '总盈亏采用与 Polymarket 个人页一致的 trade_pnl；1天/1周/1个月分别使用官方 1h/3h/18h 图表采样序列首尾差，实际区间以起止时间为准。已实现、未实现为官方仓位净盈亏字段，并非 trade_pnl 的拆分，不能相加核对图表总额。每窗口按 conditionId 合并双方持仓的全生命周期 total_pnl，不是所选周期增量，也不是账户图表口径。手续费不再手动调整。持仓价值不含可用现金；单市场列表不覆盖组合持仓。',
     };
   }
 

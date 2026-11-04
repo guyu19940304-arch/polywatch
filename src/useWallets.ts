@@ -43,21 +43,28 @@ function boundedHistory(points: HistoryPoint[], period: Period): HistoryPoint[] 
   return points.filter(point => Number.isFinite(point.timestamp) && point.timestamp >= period.start! && point.timestamp <= period.end!).sort((a, b) => a.timestamp - b.timestamp);
 }
 
+const historyBasis = (data: WalletData) => data.historyPnlBasis || data.pnlBasis || 'polymarket-position-pnl';
+const summaryBasis = (data: WalletData) => data.summary.pnlBasis || data.pnlBasis || 'polymarket-position-pnl';
+
 /** Project only the selected period. summary is always the cumulative account total. */
 export function projectWalletRange(source: WalletData, range: Range, cached?: WalletData): WalletData {
   if (source.range === range) return source;
-  const matchingCache = cached?.address === source.address && cached.range === range ? cached : undefined;
-  const period = (range !== 'all' ? source.periods?.[range] : undefined) || matchingCache?.period || waitingPeriod(range);
-  const history = range !== 'all' && source.historyAll !== undefined
+  const matchingCache = cached?.address === source.address && cached.range === range && historyBasis(cached) === historyBasis(source) ? cached : undefined;
+  const allPeriod: Period | undefined = range === 'all' && source.historyByRange?.all ? { ...source.period, range, start: null, end: source.summary.observedAt,
+    totalPnl: source.summary.totalPnl, realizedPnl: source.summary.realizedPnl, unrealizedPnl: source.summary.unrealizedPnl,
+    complete: source.summary.totalPnl !== null, pnlBasis: source.summary.pnlBasis, reason: '全历史采用官方累计值。' } : undefined;
+  const period = (range !== 'all' ? source.periods?.[range] : allPeriod) || matchingCache?.period || waitingPeriod(range);
+  const history = source.historyByRange?.[range] || (range !== 'all' && source.historyAll !== undefined
     ? boundedHistory(source.historyAll, period)
-    : matchingCache ? boundedHistory(matchingCache.history, period) : [];
+    : matchingCache ? boundedHistory(matchingCache.history, period) : []);
   return { ...source, range, period, history };
 }
 
 export function needsRangeFetch(source: WalletData | undefined, range: Range, cached?: WalletData): boolean {
   if (!source) return true;
   if (source.range === range) return false;
-  if (cached?.address === source.address && cached.range === range) return false;
+  if (source.historyByRange?.[range] && (range === 'all' || source.periods?.[range])) return false;
+  if (cached?.address === source.address && cached.range === range && historyBasis(cached) === historyBasis(source)) return false;
   return range === 'all' || !source.periods?.[range] || source.historyAll === undefined;
 }
 
@@ -130,7 +137,8 @@ function normalizeData(payload: WalletData, address: string): WalletData {
     throw new Error('数据服务返回格式无效，请刷新后重试。');
   }
   const validPoint = (point: HistoryPoint) => typeof point.timestamp === 'number' && Number.isFinite(point.timestamp);
-  return { ...payload, history: payload.history.filter(validPoint), ...(Array.isArray(payload.historyAll) ? { historyAll: payload.historyAll.filter(validPoint) } : {}) };
+  return { ...payload, history: payload.history.filter(validPoint), ...(Array.isArray(payload.historyAll) ? { historyAll: payload.historyAll.filter(validPoint) } : {}),
+    ...(payload.historyByRange ? { historyByRange: Object.fromEntries(Object.entries(payload.historyByRange).filter(([, points]) => Array.isArray(points)).map(([range, points]) => [range, points.filter(validPoint)])) } : {}) };
 }
 
 type SnapshotSection = keyof WalletData['sections'];
@@ -153,6 +161,8 @@ function hasSectionData(data: WalletData, section: SnapshotSection): boolean {
 }
 
 function preferPreviousSection(next: WalletData, previous: WalletData, section: SnapshotSection): boolean {
+  if (section === 'stats' && summaryBasis(next) !== summaryBasis(previous)) return false;
+  if (section === 'history' && historyBasis(next) !== historyBasis(previous)) return false;
   const nextAt = Date.parse(sectionOrigin(next, section) || '');
   const previousAt = Date.parse(sectionOrigin(previous, section) || '');
   if (hasSectionData(previous, section) && Number.isFinite(previousAt) && Number.isFinite(nextAt) && previousAt > nextAt) return true;
@@ -197,6 +207,8 @@ export function mergeWalletRefresh(next: WalletData, previous: WalletData | unde
     const projected = projectWalletRange(previous, next.range);
     merged.history = projected.history;
     merged.historyAll = previous.historyAll;
+    merged.historyByRange = previous.historyByRange;
+    merged.historyPnlBasis = previous.historyPnlBasis;
     merged.period = projected.period;
     merged.periods = previous.periods;
     merged.historySourceFidelity = previous.historySourceFidelity;

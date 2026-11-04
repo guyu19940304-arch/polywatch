@@ -1,5 +1,6 @@
 export type Range = '1d' | '1w' | '1m' | 'all';
 export type Amount = number | null;
+export type PnlBasis = 'polymarket-trade-pnl' | 'polymarket-position-pnl';
 
 export interface WalletConfig {
   address: string;
@@ -74,6 +75,7 @@ export interface ActivityResponse {
 }
 
 export interface WalletSummary {
+  pnlBasis?: PnlBasis;
   totalPnl: Amount;
   realizedPnl: Amount;
   unrealizedPnl: Amount;
@@ -91,9 +93,12 @@ export interface Coverage {
   complete: boolean;
   count: number;
   fetchedAt: string | null;
+  /** An upstream failure, not an intentional page/time budget limit. */
+  error?: string | null;
 }
 
 export interface Period {
+  pnlBasis?: PnlBasis;
   range: Range;
   start: number | null;
   end: number | null;
@@ -129,6 +134,8 @@ export interface MarketWindow {
 }
 
 export interface WalletData {
+  pnlBasis?: PnlBasis;
+  historyPnlBasis?: PnlBasis;
   address: string;
   fetchedAt: string;
   source: 'live' | 'demo';
@@ -141,6 +148,8 @@ export interface WalletData {
   history: HistoryPoint[];
   /** All locally retained snapshots (up to 30 days), with Unix-second timestamps. */
   historyAll?: HistoryPoint[];
+  /** Profile chart samples per range; do not mix their different grids. */
+  historyByRange?: Partial<Record<Range, HistoryPoint[]>>;
   historySourceFidelity: string | null;
   positions: Position[];
   closedPositions: Position[];

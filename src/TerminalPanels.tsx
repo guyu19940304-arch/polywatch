@@ -3,6 +3,7 @@ import { Activity, ArrowUpRight, Check, Clock3, Copy, LoaderCircle, Star, Triang
 import type { Range, WalletEntry } from './types';
 import type { TradeRow } from './TradingTable';
 import { dateTime, marketUrl, money, number, short } from './format';
+import { buildSignals, LARGE_TRADE_WINDOW_MS, startSignalClock } from './signals.ts';
 import './terminal-panels.css';
 
 const RANGE_NAMES: Record<Range, string> = { '1d': '24h', '1w': '7day', '1m': '30day', all: '全部' };
@@ -54,16 +55,6 @@ export function WalletWatchlist({ entries, selected, onSelect, onCopy, range, em
   </section>;
 }
 
-type Signal = {
-  key: string;
-  title: string;
-  detail: string;
-  kind: 'error' | 'stale' | 'coverage' | 'large';
-  time: number | string | null;
-  timePrefix?: string;
-  url?: string | null;
-};
-
 export interface SignalsPanelProps {
   entries: WalletEntry[];
   isDemo: boolean;
@@ -73,43 +64,28 @@ export interface SignalsPanelProps {
 export function SignalsPanel({ entries, isDemo, expanded = false }: SignalsPanelProps) {
   const headingId = useId();
   const [showAll, setShowAll] = useState(false);
-  const signals = useMemo(() => {
-    const operational: Signal[] = [];
-    const large: Signal[] = [];
-    for (const entry of entries) {
-      const data = entry.data;
-      const name = walletName(entry);
-      if (entry.error) operational.push({ key: `${entry.wallet.address}:error`, title: '数据更新失败', detail: `${name}：${entry.error}`, kind: 'error', time: data?.fetchedAt || null, timePrefix: '最近响应' });
-      if (!data) continue;
-      if (data.period?.stale) operational.push({ key: `${entry.wallet.address}:stale`, title: '统计快照延迟', detail: `${name} 的官方盈亏观测尚未更新，当前数字可能滞后。`, kind: 'stale', time: data.period.observedAt, timePrefix: '官方观测' });
-      if (!data.coverage.positions.complete || !data.coverage.closedPositions.complete) operational.push({ key: `${entry.wallet.address}:coverage`, title: '历史记录未完整加载', detail: `${name}：当前持仓 ${number(data.coverage.positions.count)} 条，历史持仓 ${number(data.coverage.closedPositions.count)} 条；部分记录未加载，窗口盈亏可能不完整。`, kind: 'coverage', time: null });
-      else if (data.period && !data.period.complete) operational.push({ key: `${entry.wallet.address}:period`, title: '周期边界数据不足', detail: `${name}：${data.period.reason || '官方历史快照缺少周期边界，暂不计算该周期盈亏。'}`, kind: 'coverage', time: null });
-      const duplicates = new Map<string, number>();
-      for (const trade of data.activity) {
-        if (trade.type !== 'TRADE' || trade.amount == null || trade.amount < 1000) continue;
-        const key = trade.contentKey || JSON.stringify([trade.transactionHash, trade.timestamp, trade.title, trade.outcome, trade.side, trade.price, trade.size, trade.amount]);
-        const occurrence = duplicates.get(key) || 0;
-        duplicates.set(key, occurrence + 1);
-        large.push({ key: `${entry.wallet.address}:large:${key}:${occurrence}`, title: '大额成交', detail: `${name} 在「${trade.title || '未命名市场'}」${trade.side === 'BUY' ? '买入' : trade.side === 'SELL' ? '卖出' : '成交'} ${money(trade.amount)}${trade.outcome ? ` · ${trade.outcome}` : ''}。`, kind: 'large', time: trade.timestamp, url: marketUrl(trade) });
-      }
-    }
-    large.sort((a, b) => Number(b.time || 0) - Number(a.time || 0));
-    return [...operational, ...large.slice(0, 12)];
-  }, [entries]);
+  const [nowMs, setNowMs] = useState(Date.now);
+  useEffect(() => {
+    const stopClock = startSignalClock(setNowMs);
+    const update = () => setNowMs(Date.now());
+    document.addEventListener('visibilitychange', update);
+    return () => { stopClock(); document.removeEventListener('visibilitychange', update); };
+  }, []);
+  const signals = useMemo(() => buildSignals(entries, nowMs), [entries, nowMs]);
   const all = expanded || showAll;
   const visible = all ? signals : signals.slice(0, 3);
   const loading = entries.some(entry => entry.loading) && !entries.some(entry => entry.data);
   return <section className={`tp-panel signal-panel ${expanded ? 'signal-expanded' : ''}`} aria-labelledby={headingId}>
-    <header className="tp-heading signal-heading"><h2 id={headingId}>异常提醒</h2><span className="signal-scope">{isDemo ? '示例数据' : '本页监测'}</span></header>
+    <header className="tp-heading signal-heading"><h2 id={headingId}>提醒与动态</h2><span className="signal-scope">{isDemo ? '示例数据' : '当前状态'}</span></header>
     <div className="signal-list">{visible.map(signal => {
-      const Icon = signal.kind === 'error' ? WifiOff : signal.kind === 'stale' ? Clock3 : TriangleAlert;
+      const Icon = signal.kind === 'error' ? WifiOff : signal.kind === 'stale' ? Clock3 : Activity;
       return <article key={signal.key} className={`signal-item signal-${signal.kind}`}>
         <Icon size={20} className="signal-icon" aria-hidden="true"/>
-        <div className="signal-content"><div className="signal-item-heading"><h3>{signal.title}</h3>{signal.time != null && <time title={`${signal.timePrefix ? `${signal.timePrefix} · ` : ''}${dateTime(signal.time)}`}>{signal.timePrefix && <span>{signal.timePrefix} </span>}{dateTime(signal.time)}</time>}</div><p title={signal.detail}>{signal.detail}</p>{signal.url && <a className="signal-market-link" href={signal.url} target="_blank" rel="noreferrer">查看市场<ArrowUpRight size={11}/></a>}</div>
+        <div className="signal-content"><div className="signal-item-heading"><h3>{signal.title}{signal.kind === 'large' && <span className="signal-kind">非异常</span>}</h3>{signal.time != null && <time title={`${signal.timePrefix ? `${signal.timePrefix} · ` : ''}${dateTime(signal.time)}`}>{signal.timePrefix && <span>{signal.timePrefix} </span>}{dateTime(signal.time)}</time>}</div><p title={signal.detail}>{signal.detail}</p>{signal.url && <a className="signal-market-link" href={signal.url} target="_blank" rel="noreferrer">查看市场<ArrowUpRight size={11}/></a>}</div>
       </article>;
     })}
-    {!signals.length && <div className="tp-empty signal-empty">{loading ? <LoaderCircle size={21} className="tp-spinning"/> : <Check size={21}/>}<strong>{loading ? '正在读取监测数据' : '未发现本页提醒'}</strong><span>{loading ? '数据返回后检查刷新状态与大额成交。' : '当前已加载数据未触发提醒。'}</span></div>}</div>
-    <footer className="signal-footer"><span>仅已加载数据 · 单笔成交 ≥ $1,000</span>{!expanded && signals.length > 3 && <button className="tp-text-button" onClick={() => setShowAll(value => !value)}>{showAll ? '收起' : `展开 ${signals.length} 项`}</button>}<p>仅在当前页面检查，不提供全天候后台告警。</p></footer>
+    {!signals.length && <div className="tp-empty signal-empty">{loading ? <LoaderCircle size={21} className="tp-spinning"/> : <Check size={21}/>}<strong>{loading ? '正在读取监测数据' : '当前无异常或近期大额成交'}</strong><span>{loading ? '数据返回后检查更新状态与近5分钟成交。' : '仅检查已加载数据，成交动态会自动过期。'}</span></div>}</div>
+    <footer className="signal-footer"><span>仅已加载数据 · 单笔成交 ≥ $1,000</span>{!expanded && signals.length > 3 && <button className="tp-text-button" onClick={() => setShowAll(value => !value)}>{showAll ? '收起' : `展开 ${signals.length} 项`}</button>}<p>成交窗口 {clockTime((nowMs - LARGE_TRADE_WINDOW_MS) / 1000)}–{clockTime(nowMs / 1000)} · UTC+8 · 近5分钟</p><p>故障恢复后清除；历史范围见“数据边界与来源说明”。仅本页提示。</p></footer>
   </section>;
 }
 

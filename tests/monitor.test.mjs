@@ -272,7 +272,8 @@ function completeSnapshot(at = START) {
   const periods = Object.fromEntries([['1d', 1], ['1w', 7], ['1m', 30]].map(([range, days]) => [range,
     { range, start: sec - days * 86400, end: sec, totalPnl: 10, realizedPnl: 8, unrealizedPnl: 2, complete: true, stale: false, observedAt: sec, sourceFidelity: '1d', reason: null }]));
   return { address: ADDRESS, source: 'live', fetchedAt: new Date(at).toISOString(), range: '1m',
-    summary: { totalPnl: 10, realizedPnl: 8, unrealizedPnl: 2, positionValue: 30, observedAt: sec, volume: 100 },
+    pnlBasis: 'polymarket-trade-pnl', historyPnlBasis: 'polymarket-trade-pnl',
+    summary: { totalPnl: 10, realizedPnl: 8, unrealizedPnl: 2, positionValue: 30, observedAt: sec, volume: 100, pnlBasis: 'polymarket-trade-pnl' },
     periods, period: periods['1m'], historyAll: [{ timestamp: sec - 86400, totalPnl: 0, realizedPnl: 0, unrealizedPnl: 0 }, { timestamp: sec, totalPnl: 10, realizedPnl: 8, unrealizedPnl: 2 }],
     history: [{ timestamp: sec, totalPnl: 10, realizedPnl: 8, unrealizedPnl: 2 }], historySourceFidelity: '1d',
     positions: [{ id: 'held', conditionId, title: 'BTC', outcome: 'Up', timestamp: sec, status: 'OPEN', totalPnl: 10, realizedPnl: 8, unrealizedPnl: 2, currentValue: 30, slug: 'btc-updown-5m-1800000000' }],
@@ -372,4 +373,43 @@ test('first partial snapshot stays explicitly partial; failed activity does not 
   assert.equal(saved.sections.activity, 'error');
   assert.match(monitor.status().wallets[0].snapshotError, /部分接口异常/);
   await monitor.stop();
+});
+
+test('partial refresh never revives legacy totals or curves under the new profile basis', () => {
+  const previous = completeSnapshot();
+  previous.pnlBasis = 'polymarket-position-pnl';
+  previous.historyPnlBasis = 'polymarket-position-pnl';
+  previous.summary.pnlBasis = 'polymarket-position-pnl';
+  previous.historyByRange = { '1d': previous.history, all: previous.historyAll };
+  const next = completeSnapshot(START + 60000);
+  next.pnlBasis = next.historyPnlBasis = next.summary.pnlBasis = 'polymarket-trade-pnl';
+  next.historyByRange = { '1d': [{ timestamp: START / 1000, totalPnl: 999 }] };
+  next.sections.history = 'error';
+  let merged = mergeCollectedSnapshot(next, previous);
+  assert.equal(merged.summary.pnlBasis, 'polymarket-trade-pnl');
+  assert.equal(merged.historyPnlBasis, 'polymarket-trade-pnl');
+  assert.deepEqual(merged.historyByRange, {});
+  assert.deepEqual(merged.historyAll, []);
+  assert.equal(merged.period.complete, false);
+  assert.equal(merged.period.totalPnl, null);
+  assert.equal(merged.sectionFetchedAt.history, null);
+  assert.ok(merged.warnings.some(value => value.includes('旧口径曲线未用于回退')));
+  next.sections.history = 'ok'; next.sections.stats = 'error';
+  merged = mergeCollectedSnapshot(next, previous);
+  assert.equal(merged.summary.pnlBasis, 'polymarket-trade-pnl');
+  assert.equal(merged.summary.totalPnl, null);
+  assert.equal(merged.pnlBasis, 'polymarket-trade-pnl');
+  assert.equal(merged.historyPnlBasis, 'polymarket-trade-pnl');
+  assert.deepEqual(merged.historyByRange, next.historyByRange);
+  assert.equal(merged.sectionFetchedAt.stats, null);
+});
+
+test('same-basis history fallback keeps the selected official grid instead of rebuilding it from all history', () => {
+  const previous = completeSnapshot();
+  previous.historyByRange = { '1d': [{ timestamp: START / 1000 - 7200, totalPnl: 4 }], all: previous.historyAll };
+  const next = completeSnapshot(START + 60000); next.range = '1d'; next.sections.history = 'error';
+  const result = mergeCollectedSnapshot(next, previous);
+  assert.deepEqual(result.history, previous.historyByRange['1d']);
+  assert.deepEqual(result.historyByRange, previous.historyByRange);
+  assert.equal(result.historyPnlBasis, 'polymarket-trade-pnl');
 });

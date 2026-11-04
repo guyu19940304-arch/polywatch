@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPolymarketClient, normalizeActivity, numberOrNull, calculatePeriod, aggregateWindows } from '../server/polymarket.mjs';
+import { createPolymarketClient, normalizeActivity, normalizePnl, numberOrNull, calculatePeriod, calculateProfilePeriod, pnlIsStale, aggregateWindows } from '../server/polymarket.mjs';
 import { createServer } from '../server/index.mjs';
 
 const ADDRESS = `0x${'a'.repeat(40)}`;
 const CONDITION = `0x${'b'.repeat(64)}`;
-const point = { timestamp: 1793664000, realized_pnl: 120, unrealized_pnl: -20, position_pnl: 100,
+const point = { timestamp: 1793664000, realized_pnl: 120, unrealized_pnl: -20, position_pnl: 100, trade_pnl: 104,
   economic_pnl: 105, wallet_income: 5, fees_paid: -4, volume_usdc: 1000, trade_count: 8 };
 const position = { token_id: 'token1', title: 'Market A?', current_size: 10, current_value: 6,
   realized_pnl: 2, unrealized_pnl: 1, total_pnl: 3, status: 'OPEN', name: 'Trader' };
@@ -35,20 +35,22 @@ test('summary uses full-history official PnL, not loaded positions; fees are not
   const f = fixture();
   const result = await createPolymarketClient(f).wallet(ADDRESS.toUpperCase().replace('0X', '0x'));
   assert.equal(result.address, ADDRESS);
-  assert.equal(result.summary.totalPnl, 100);
+  assert.equal(result.summary.totalPnl, 104);
+  assert.equal(result.summary.pnlBasis, 'polymarket-trade-pnl');
+  assert.equal(result.historyPnlBasis, 'polymarket-trade-pnl');
   assert.equal(result.summary.realizedPnl, 120);
   assert.equal(result.summary.unrealizedPnl, -20);
   assert.equal(result.summary.positionValue, 6);
   assert.equal(result.summary.feesPaid, -4);
   assert.equal(result.activity[0].amount, 6.12, 'use official cash amount including actual fill economics');
-  assert.equal(result.history[0].totalPnl, 100);
+  assert.equal(result.history[0].totalPnl, 104);
   assert.equal(result.warnings.length, 0);
 });
 
 test('unknown and unavailable amounts are never converted to zero', async () => {
   for (const value of [null, undefined, '', '2', NaN, Infinity]) assert.equal(numberOrNull(value), null);
   assert.equal(numberOrNull(0), 0);
-  const f = fixture({ '/v2/user-stats': () => response({ data: { all_time_pnl: { ...point, unrealized_pnl: null, position_pnl: null } } }) });
+  const f = fixture({ '/v2/user-stats': () => response({ data: { all_time_pnl: { ...point, unrealized_pnl: null, trade_pnl: null } } }) });
   const result = await createPolymarketClient(f).wallet(ADDRESS);
   assert.equal(result.summary.totalPnl, null);
   assert.equal(result.summary.unrealizedPnl, null);
@@ -79,7 +81,8 @@ test('pagination cap and later-page failure disclose partial lists, never partia
   const f = fixture({ '/v2/positions': url => response(url.searchParams.get('status') === 'CLOSED' ? page([]) : page([position], 'nextpage')) });
   const capped = await createPolymarketClient({ ...f, maxPositionPages: 1 }).wallet(ADDRESS);
   assert.equal(capped.coverage.positions.complete, false);
-  assert.equal(capped.summary.totalPnl, 100);
+  assert.equal(capped.summary.totalPnl, 104);
+  assert.equal(capped.coverage.positions.error, null, 'intentional pagination limits are not upstream errors');
   assert.match(capped.warnings.join(''), /列表不完整/);
   const failed = fixture({ '/v2/positions': url => {
     if (url.searchParams.get('status') === 'CLOSED') return response(page([]));
@@ -88,6 +91,7 @@ test('pagination cap and later-page failure disclose partial lists, never partia
   const result = await createPolymarketClient(failed).wallet(ADDRESS);
   assert.equal(result.positions.length, 1);
   assert.equal(result.coverage.positions.complete, false);
+  assert.match(result.coverage.positions.error, /503/);
   assert.match(result.warnings.join(''), /503/);
 });
 
@@ -110,17 +114,17 @@ test('activity cache expires independently of portfolio cache and concurrent req
   const f = fixture();
   const client = createPolymarketClient({ ...f, now: () => now });
   await Promise.all([client.wallet(ADDRESS), client.wallet(ADDRESS)]);
-  assert.equal(f.calls.length, 6);
+  assert.equal(f.calls.length, 9);
   now += 15000;
   await client.wallet(ADDRESS);
-  assert.equal(f.calls.length, 7);
+  assert.equal(f.calls.length, 10);
   assert.equal(f.calls.at(-1).url.pathname, '/v2/activity');
   now += 60000;
   await client.wallet(ADDRESS);
-  assert.equal(f.calls.length, 13, 'open and closed books refresh together');
+  assert.equal(f.calls.length, 19, 'open and closed books refresh together');
   now += 300000;
   await client.wallet(ADDRESS);
-  assert.equal(f.calls.length, 19);
+  assert.equal(f.calls.length, 28);
 });
 
 test('activity cursor requests retain full history, direction and deposit inclusion', async () => {
@@ -166,7 +170,7 @@ test('HTTP routes expose health and validated API; unsupported methods and paths
   assert.equal((await fetch(`${base}/api/health`)).status, 200);
   const result = await fetch(`${base}/api/wallet/${ADDRESS}`);
   assert.equal(result.status, 200);
-  assert.equal((await result.json()).summary.totalPnl, 100);
+  assert.equal((await result.json()).summary.totalPnl, 104);
   assert.equal((await fetch(`${base}/api/wallet/invalid`)).status, 400);
   assert.equal((await fetch(`${base}/api/unknown`)).status, 404);
   assert.equal((await fetch(`${base}/api/health`, { method: 'POST' })).status, 405);
@@ -209,11 +213,58 @@ test('period discloses stale observations and never interpolates an off-grid end
   const points = [{ timestamp: end - 86400, totalPnl: 2, realizedPnl: 2, unrealizedPnl: 0 },
     { timestamp: end, totalPnl: 10, realizedPnl: 10, unrealizedPnl: 0 },
     { timestamp: end + 500, totalPnl: 20, realizedPnl: 20, unrealizedPnl: 0 }];
-  const p = calculatePeriod(points, '1d', '1d', end, end + 10800);
+  const p = calculatePeriod(points, '1d', '1h', end, end + 10800);
   assert.equal(p.end, end);
   assert.equal(p.totalPnl, 8);
   assert.equal(p.stale, true);
-  assert.match(p.reason, /超过 2 小时/);
+  assert.match(p.reason, /宽限期/);
+});
+
+test('profile PnL matches interval chart boundaries and never substitutes position/economic PnL', async () => {
+  const end = point.timestamp;
+  const configurations = { '1d': ['1h', 23 * 3600, 4], '1w': ['3h', 165 * 3600, 14], '1m': ['18h', 708 * 3600, 44], all: ['1d', 90 * 86400, 1] };
+  const f = fixture({ '/v2/user-pnl': url => {
+    const [fidelity, duration, startPnl] = configurations[url.searchParams.get('interval')];
+    assert.equal(url.searchParams.get('fidelity'), fidelity);
+    return response({ data: { source_fidelity: '1d', points: [{ ...point, timestamp: end - duration, trade_pnl: startPnl }, point] } });
+  } });
+  const client = createPolymarketClient({ ...f, now: () => (end + 4 * 3600) * 1000 });
+  const result = await client.wallet(ADDRESS, '1d');
+  assert.equal(result.summary.totalPnl, 104);
+  assert.equal(result.period.totalPnl, 100);
+  assert.equal(result.period.end - result.period.start, 23 * 3600);
+  assert.equal(result.period.complete, true);
+  assert.equal(result.period.stale, false, 'daily observations are not called stale after only four hours');
+  assert.equal(result.periods['1w'].totalPnl, 90);
+  assert.equal(result.periods['1m'].totalPnl, 60);
+  assert.equal(result.historyByRange['1w'][0].totalPnl, 14);
+  assert.equal((await client.wallet(ADDRESS, 'all')).period.totalPnl, 104, 'ALL is cumulative trade_pnl, not first/last difference');
+  assert.equal(normalizePnl({ ...point, trade_pnl: undefined }).totalPnl, null);
+  const unavailable = calculateProfilePeriod([{ timestamp: end - 23 * 3600, totalPnl: null }, normalizePnl(point)], '1d');
+  assert.equal(unavailable.complete, false);
+  assert.equal(unavailable.totalPnl, null);
+  assert.equal(calculateProfilePeriod([normalizePnl(point)], '1d').totalPnl, null);
+});
+
+test('PnL freshness follows the observation source rather than the resampled grid', () => {
+  const observed = 1793664000;
+  assert.equal(pnlIsStale(observed, '1d', observed + 4 * 3600), false);
+  assert.equal(pnlIsStale(observed, '1d', observed + 49 * 3600), true);
+  assert.equal(pnlIsStale(observed, '1h', observed + 3 * 3600), true);
+  assert.equal(pnlIsStale(null, '1d', observed), false);
+});
+
+test('a walk budget is partial coverage without being labelled an upstream failure', async () => {
+  let clock = 0;
+  const f = fixture({ '/v2/positions': url => {
+    if (url.searchParams.get('status') === 'CLOSED') return response(page([]));
+    clock = 9000;
+    return response(page([position], 'nextpage'));
+  } });
+  const result = await createPolymarketClient({ ...f, now: () => clock }).wallet(ADDRESS);
+  assert.equal(result.coverage.positions.complete, false);
+  assert.equal(result.coverage.positions.error, null);
+  assert.match(result.warnings.join(''), /时间上限/);
 });
 
 test('each BTC 5m condition combines both outcomes once, including current and closed tokens', () => {

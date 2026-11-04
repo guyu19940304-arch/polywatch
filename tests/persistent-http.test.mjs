@@ -9,8 +9,9 @@ const now = 1800000000000;
 const seconds = now / 1000;
 function snapshot() {
   return { address, fetchedAt: new Date(now - 1000).toISOString(), source: 'live', range: '1m',
-    profile: { name: 'Test', avatar: '' }, summary: { totalPnl: 100, realizedPnl: 80, unrealizedPnl: 20, observedAt: seconds, positionValue: 10 },
-    periods: Object.fromEntries([['1d', 86400], ['1w', 604800], ['1m', 2592000]].map(([range, delta]) => [range, { range, start: seconds - delta, end: seconds, totalPnl: 5, realizedPnl: 3, unrealizedPnl: 2, complete: true }])),
+    pnlBasis: 'polymarket-trade-pnl', historyPnlBasis: 'polymarket-trade-pnl',
+    profile: { name: 'Test', avatar: '' }, summary: { totalPnl: 100, realizedPnl: 80, unrealizedPnl: 20, observedAt: seconds, positionValue: 10, pnlBasis: 'polymarket-trade-pnl' },
+    periods: Object.fromEntries([['1d', 86400], ['1w', 604800], ['1m', 2592000]].map(([range, delta]) => [range, { range, start: seconds - delta, end: seconds, totalPnl: 5, realizedPnl: 3, unrealizedPnl: 2, complete: true, pnlBasis: 'polymarket-trade-pnl' }])),
     history: [{ timestamp: seconds - 100, totalPnl: 90, realizedPnl: 75, unrealizedPnl: 15 }, { timestamp: seconds, totalPnl: 100, realizedPnl: 80, unrealizedPnl: 20 }],
     positions: [], closedPositions: [], windows: [], activity: [], warnings: [],
     coverage: { positions: { complete: true, count: 0 }, closedPositions: { complete: true, count: 0 } },

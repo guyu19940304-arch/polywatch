@@ -13,3 +13,5 @@ data/
 .npmrc
 docs/*
 !docs/deployment-public.md
+!docs/storage.md
+!docs/api.md

@@ -27,8 +27,8 @@ function Methodology({ onClose, background }: { onClose: () => void; background:
   return <dialog ref={ref} className="info-dialog" onCancel={onClose} onClick={e => { if (e.target === e.currentTarget) onClose(); }} aria-labelledby="methodology-title">
     <div className="modal-top"><span className="eyebrow">DATA METHODOLOGY</span><button className="icon-button" aria-label="关闭说明" onClick={onClose}><X size={19}/></button></div>
     <h2 id="methodology-title">盈亏统计口径</h2>
-    <p><b>周期总盈亏</b>：官方累计仓位盈亏在所选时间段内的变化。24h / 7day / 30day 为滚动周期，依据可用快照计算；边界缺失时显示“—”并提示。</p>
-    <p><b>累计总盈亏</b> = 已实现盈亏 + 未实现盈亏。手续费沿用官方口径，不重复扣除；奖励、返佣、存取款不并入仓位盈亏。</p>
+    <p><b>周期总盈亏</b>：与 Polymarket 个人主页图表对齐。24h / 7day / 30day 对应官网 1D / 1W / 1M，取各自官方采样序列的首尾差；实际观测区间以页面说明为准，并不代表逐笔精确滚动时长。</p>
+    <p><b>累计总盈亏</b>：使用官网图表的交易盈亏口径（trade_pnl），与净仓位盈亏和含奖励收入的经济盈亏不同。辅助显示的“已实现仓位盈亏变化”直接来自官方净已实现字段，不能作为图表总盈亏的拆分项相加；不对其自行加减费用。</p>
     <p><b>窗口盈亏</b>：同一市场 conditionId 的 Up / Down 等结果仓位合并，包含已平仓和当前持仓；每个窗口显示该窗口的累计盈亏，独立于顶部周期选择。BTC 5m 按市场 slug 识别。</p>
     <p><b>更新速度</b>：{background ? '后台持续采集，前台每5秒读取成交，盈亏及持仓快照每60秒更新。关闭网页不影响后台任务。' : '前台每15秒检查新交易，盈亏快照缓存60秒；页面隐藏时暂停刷新。'}官方索引和盈亏统计可能延迟，实际观测时间显示在界面中。</p>
     <p><b>历史与提醒</b>：{background ? '本地数据库滚动保留30天的交易与历史快照，首次启动后逐页补齐；当前仍在持有的仓位及最新官方累计摘要保留用于计算。' : '当前为前台监测，尚未开启持久化采集。'}提醒显示在页面内，没有外部消息推送。</p>

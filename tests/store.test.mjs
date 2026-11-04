@@ -1,10 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, statSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { inflateRawSync } from 'node:zlib';
 import { basename, dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
-import { createStore, StoreError } from '../server/store.mjs';
+import { createStore, compactStore, StoreError } from '../server/store.mjs';
 
 const TEMP_ROOT = resolve(process.env.POLYWATCH_TEST_TMP || process.env.TMPDIR || tmpdir());
 const ROOT = join(TEMP_ROOT, 'polywatch-store-tests');
@@ -14,6 +16,7 @@ const DAY = 86400;
 const NOW = Date.parse('2026-11-03T08:00:00.000Z');
 const SEC = NOW / 1000;
 const CUTOFF = SEC - 30 * DAY;
+const decoded = value => JSON.parse(value.startsWith('z1:') ? inflateRawSync(Buffer.from(value.slice(3), 'base64')).toString() : value);
 const point = (timestamp, totalPnl = 10) => ({ timestamp, totalPnl, realizedPnl: totalPnl - 2, unrealizedPnl: 2 });
 const position = (id, timestamp, status = 'CLOSED') => ({ id, conditionId: `condition-${id}`, timestamp, status, outcome: 'Up', totalPnl: 3, realizedPnl: 3, unrealizedPnl: 0 });
 const activity = (timestamp, contentKey = 'fill') => ({ id: 'upstream-page-id', contentKey, timestamp, type: 'TRADE', side: 'BUY', price: 0.5, size: 10, amount: 5, transactionHash: '0xabc', title: 'BTC', outcome: 'Up' });
@@ -21,7 +24,8 @@ function snapshot(overrides = {}) {
   const periods = Object.fromEntries([['1d', 1], ['1w', 7], ['1m', 30]].map(([range, days]) => [range, { range, start: SEC - days * DAY - 100, end: SEC - 100,
     totalPnl: days * 10, realizedPnl: days * 10, unrealizedPnl: 0, complete: true, observedAt: SEC - 100, stale: false, reason: null, sourceFidelity: '1d' }]));
   return { address: A, source: 'live', range: '1m', fetchedAt: new Date(NOW - 1000).toISOString(), activityFetchedAt: new Date(NOW - 2000).toISOString(),
-    summary: { ...point(SEC), observedAt: SEC - 100, positionValue: 15 }, periods, period: periods['1m'],
+    pnlBasis: 'polymarket-trade-pnl', historyPnlBasis: 'polymarket-trade-pnl',
+    summary: { ...point(SEC), observedAt: SEC - 100, positionValue: 15, pnlBasis: 'polymarket-trade-pnl' }, periods, period: periods['1m'],
     positions: [position('open', CUTOFF - DAY, 'OPEN'), position('redeemable', null, 'REDEEMABLE')],
     closedPositions: [position('old', CUTOFF - 1), position('edge', CUTOFF), position('recent', SEC - 200), position('unknown', null)],
     windows: [{ ...position('old', CUTOFF - 1), complete: true }, { ...position('recent', SEC - 200), complete: true }, { ...position('unknown', null), complete: true }],
@@ -144,8 +148,8 @@ test('rolling cutoff is inclusive, reads hide expired data before prune, and pru
   assert.equal(store.readActivities(A).fetchedAt, new Date(NOW).toISOString(), 'read/prune must not pretend to be a successful poll');
   const raw = new DatabaseSync(context.filename, { readOnly: true });
   try {
-    const saved = JSON.parse(raw.prepare('SELECT payload FROM snapshots WHERE address=?').get(A).payload);
-    const state = JSON.parse(raw.prepare('SELECT payload FROM collector_states WHERE address=?').get(A).payload);
+    const saved = decoded(raw.prepare('SELECT payload FROM snapshots WHERE address=?').get(A).payload);
+    const state = decoded(raw.prepare('SELECT payload FROM collector_states WHERE address=?').get(A).payload);
     assert.ok(saved.closedPositions.every(row => row.timestamp >= CUTOFF + 1));
     assert.equal(saved.history.length, 0, 'large raw history lives only in the indexed points table');
     assert.deepEqual(state.head.carry.map(row => row.contentKey), ['fresh']);
@@ -210,4 +214,160 @@ test('null PnL stays unavailable, shorter retention works, and unconfirmed non-c
   assert.equal(result.historyAll.length, 1);
   assert.equal(result.historyAll[0].totalPnl, null);
   assert.equal(result.historyAll[0].unrealizedPnl, null);
+});
+
+function wideActivities(count) {
+  return Array.from({ length: count }, (_, index) => {
+    const hash = `0x${createHash('sha256').update(String(index)).digest('hex')}`;
+    const contentKey = JSON.stringify([hash, SEC - index, 'TRADE', 'BUY', `bitcoin-up-or-down-${SEC - index}`, 'Up', .5, 10, 5, false]);
+    return { ...activity(SEC - index, contentKey), transactionHash: hash, slug: `bitcoin-up-or-down-${SEC - index}`,
+      eventSlug: `bitcoin-up-or-down-${SEC - index}`, title: 'Bitcoin Up or Down - November 3, 12:00PM-12:05PM ET',
+      icon: 'https://polymarket-upload.s3.us-east-2.amazonaws.com/BTC.png', isCombo: false };
+  });
+}
+
+function legacyDatabase(filename, rows) {
+  const seed = createStore({ path: filename, now: () => NOW }); seed.close();
+  const raw = new DatabaseSync(filename);
+  try {
+    raw.exec(`UPDATE metadata SET value='1' WHERE key='schema_version';
+      DROP TABLE activities;
+      CREATE TABLE activities(address TEXT NOT NULL,timestamp INTEGER NOT NULL,content_key TEXT NOT NULL,occurrence INTEGER NOT NULL,id TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(address,timestamp,content_key,occurrence)) WITHOUT ROWID, STRICT;
+      CREATE UNIQUE INDEX activity_id ON activities(address,id);
+      CREATE INDEX activity_feed ON activities(address,timestamp DESC,id DESC);
+      CREATE INDEX activity_expiry ON activities(timestamp);
+      DROP TABLE pnl_points;
+      CREATE TABLE pnl_points(address TEXT NOT NULL,timestamp INTEGER NOT NULL,payload TEXT NOT NULL,source_at INTEGER NOT NULL,PRIMARY KEY(address,timestamp)) WITHOUT ROWID, STRICT;
+      CREATE INDEX pnl_expiry ON pnl_points(timestamp);
+      BEGIN`);
+    const insert = raw.prepare('INSERT INTO activities VALUES(?,?,?,?,?,?)');
+    for (const row of rows) {
+      const id = `local-${createHash('sha256').update(JSON.stringify([A, row.timestamp, row.contentKey, 0])).digest('hex')}`;
+      insert.run(A, row.timestamp, row.contentKey, 0, id, JSON.stringify({ ...row, id }));
+    }
+    raw.prepare('INSERT INTO snapshots VALUES(?,?,?,?)').run(A, JSON.stringify(snapshot({ pnlBasis: 'polymarket-position-pnl', historyPnlBasis: 'polymarket-position-pnl', summary: { ...snapshot().summary, pnlBasis: 'polymarket-position-pnl' } })), NOW - 1000, NOW);
+    raw.prepare('INSERT INTO collector_states VALUES(?,?,?)').run(A, JSON.stringify({ version: 1, head: { carry: rows.slice(0, 1), cursor: 'pending' }, backfill: { carry: [] } }), NOW);
+    raw.prepare('INSERT INTO activity_sync VALUES(?,?)').run(A, new Date(NOW).toISOString());
+    raw.prepare('INSERT INTO pnl_points VALUES(?,?,?,?)').run(A, SEC - 100, JSON.stringify(point(SEC - 100)), NOW);
+    raw.exec('COMMIT; PRAGMA wal_checkpoint(TRUNCATE)');
+  } finally { raw.close(); }
+}
+
+test('compact ROWID layout prevents wide-key overflow growth and offline copying preserves every record and cursor', t => {
+  const context = setup(t), rows = wideActivities(3000);
+  const original = join(dirname(context.filename), 'legacy.sqlite');
+  const output = join(dirname(context.filename), 'compact.sqlite');
+  legacyDatabase(original, rows);
+  const originalBytes = statSync(original).size;
+  const legacy = createStore({ path: original, now: () => NOW });
+  const before = legacy.readActivities(A, null, 100);
+  const oldState = legacy.getState(A);
+  legacy.close();
+  const sourceHash = createHash('sha256');
+  // Only fixed metadata/rows are compared below; no test mutates the source during compaction.
+  const sourceRead = new DatabaseSync(original, { readOnly: true });
+  for (const row of sourceRead.prepare('SELECT payload FROM activities ORDER BY timestamp').iterate()) sourceHash.update(row.payload);
+  const hashBefore = sourceHash.digest('hex'); sourceRead.close();
+  const result = compactStore({ path: original, outputPath: output });
+  assert.equal(result.sourceUnchanged, true); assert.equal(result.replaced, false);
+  assert.equal(result.counts.activities, rows.length);
+  assert.equal(Object.keys(result.contentDigests).length, 6);
+  for (const digest of Object.values(result.contentDigests)) assert.equal(digest.source, digest.output, 'every logical record must match after lossless decoding');
+  assert.ok(result.outputBytes < originalBytes * .65, `compact ${result.outputBytes} must materially improve legacy ${originalBytes}`);
+  const compact = createStore({ path: output, now: () => NOW });
+  try {
+    assert.deepEqual(compact.readActivities(A, null, 100), before);
+    assert.deepEqual(compact.getState(A), oldState);
+    assert.equal(compact.readActivities(A, before.pagination.nextCursor, 100).activity[0].timestamp, SEC - 100, 'saved local cursor remains valid after copying');
+    assert.equal(compact.stats().activities, rows.length);
+    assert.equal(compact.getSnapshot(A).summary.totalPnl, null, 'old basis remains stored but must not be published as the new profile total');
+    assert.ok(compact.getSnapshot(A).warnings.some(value => value.includes('口径升级中')));
+    const check = new DatabaseSync(output, { readOnly: true });
+    assert.doesNotMatch(check.prepare("SELECT sql FROM sqlite_schema WHERE name='activities'").get().sql, /WITHOUT ROWID/);
+    assert.equal(check.prepare("SELECT count(*) n FROM dbstat WHERE name='activities' AND pagetype='overflow'").get().n, 0);
+    check.close();
+  } finally { compact.close(); }
+  const unchanged = new DatabaseSync(original, { readOnly: true });
+  const sourceHashAfter = createHash('sha256');
+  for (const row of unchanged.prepare('SELECT payload FROM activities ORDER BY timestamp').iterate()) sourceHashAfter.update(row.payload);
+  assert.equal(sourceHashAfter.digest('hex'), hashBefore); unchanged.close();
+  t.diagnostic(`Actual files: legacy=${originalBytes} bytes, compact=${result.outputBytes} bytes, rows=${rows.length}`);
+});
+
+test('offline compaction refuses low space, an existing output, and an active WAL without touching source', t => {
+  const context = setup(t), source = join(dirname(context.filename), 'legacy.sqlite');
+  legacyDatabase(source, wideActivities(3));
+  const output = join(dirname(context.filename), 'compact.sqlite');
+  assert.throws(() => compactStore({ path: source, outputPath: output, availableBytes: () => 0 }), /空间不足/);
+  assert.equal(existsSync(output), false);
+  assert.throws(() => compactStore({ path: source, outputPath: source }), /禁止覆盖/);
+  context.store.saveSnapshot(A, snapshot());
+  assert.throws(() => compactStore({ path: context.filename, outputPath: output }), /WAL/);
+  assert.equal(existsSync(output), false);
+});
+
+test('identical polling does not rewrite payload pages and expiry drains incremental vacuum into real file shrinkage', t => {
+  const context = setup(t), rows = wideActivities(3500);
+  context.store.ingestActivityGroups(A, rows);
+  context.store.saveState(A, { version: 1, head: { carry: [], cursor: null } });
+  context.store.saveSnapshot(A, snapshot());
+  context.reopen();
+  const initial = context.store.stats();
+  for (let index = 0; index < 20; index++) {
+    const result = context.store.ingestActivityGroups(A, rows.slice(0, 100));
+    assert.equal(result.unchanged, 100);
+    context.store.saveState(A, { version: 1, head: { carry: [], cursor: null } });
+    context.store.saveSnapshot(A, snapshot());
+  }
+  const repeated = context.store.stats();
+  assert.equal(repeated.walBytes, initial.walBytes, 'unchanged successful checks at the same clock must cause no additional WAL writes');
+  assert.equal(repeated.pageCount, initial.pageCount);
+  context.setNow(NOW + 31 * DAY * 1000);
+  let reclaimed = 0;
+  for (let index = 0; index < 20; index++) {
+    const result = context.store.prune(); reclaimed += result.reclaimedPages;
+    if (!context.store.stats().freePages) break;
+  }
+  const final = context.store.stats();
+  assert.equal(final.activities, 0); assert.equal(final.pnlPoints, 0);
+  assert.ok(reclaimed > 200, 'vacuum steps must be fully consumed, not only one page per cleanup');
+  assert.ok(final.databaseBytes < initial.databaseBytes * .2, 'expired rows release actual disk pages, not only SQL row counts');
+  assert.equal(final.walBytes, 0);
+  assert.equal(context.store.getSnapshot(A).summary.totalPnl, 10, 'latest cumulative totals are retained');
+  assert.equal(context.store.getSnapshot(A).positions.length, 2, 'current holdings are retained');
+  t.diagnostic(`Actual expiry shrink: before=${initial.databaseBytes}, after=${final.databaseBytes}, reclaimedPages=${reclaimed}`);
+});
+
+test('legacy and official trade PnL points stay separate and period charts retain their own official grids', t => {
+  const context = setup(t); context.store.saveSnapshot(A, snapshot({ pnlBasis: 'polymarket-position-pnl', historyPnlBasis: 'polymarket-position-pnl', summary: { ...snapshot().summary, pnlBasis: 'polymarket-position-pnl' }, history: [point(SEC - 100, 10)] }));
+  assert.equal(context.store.getSnapshot(A).summary.totalPnl, null);
+  assert.equal(context.store.getSnapshot(A).period.totalPnl, null);
+  assert.deepEqual(context.store.getSnapshot(A).historyAll, []);
+  const tradeBasis = 'polymarket-trade-pnl';
+  const byRange = { '1d': [point(SEC - 23 * 3600, 100), point(SEC - 100, 200)], '1w': [point(SEC - 7 * DAY + 3600, 50), point(SEC - 200, 180)], '1m': [point(CUTOFF - 1, -50), point(CUTOFF + DAY, -20), point(SEC - 300, 160)], all: [point(CUTOFF + DAY, -20), point(SEC - 400, 150)] };
+  context.store.saveSnapshot(A, snapshot({ fetchedAt: new Date(NOW).toISOString(), pnlBasis: tradeBasis, historyPnlBasis: tradeBasis,
+    summary: { ...snapshot().summary, totalPnl: 200, pnlBasis: tradeBasis }, historyByRange: byRange, history: [], historyAll: [] }));
+  const result = context.store.getSnapshot(A, '1d');
+  assert.deepEqual(result.history, byRange['1d']);
+  assert.deepEqual(result.historyAll, byRange.all, 'all history must keep its official grid, not merge the 1d/1w/1m grids');
+  assert.equal(result.historyAll.some(row => row.totalPnl === 10), false);
+  assert.deepEqual(context.store.getSnapshot(A, '1w').history, byRange['1w']);
+  assert.deepEqual(context.store.getSnapshot(A, '1m').history, byRange['1m'].slice(1));
+  const raw = new DatabaseSync(context.filename, { readOnly: true });
+  const bases = raw.prepare('SELECT DISTINCT basis FROM pnl_points ORDER BY basis').all().map(row => row.basis);
+  assert.deepEqual(bases, ['polymarket-position-pnl', tradeBasis], 'old points are retained until normal expiry, not silently relabeled'); raw.close();
+});
+
+test('daily observations are not falsely marked stale after four hours', t => {
+  const context = setup(t); context.store.saveSnapshot(A, snapshot());
+  context.setNow(NOW + 4 * 3600 * 1000);
+  assert.equal(context.store.getSnapshot(A, '1d').period.stale, false);
+  assert.equal(context.store.getSnapshot(A, 'all').period.stale, false);
+});
+
+test('all-time profile total stays complete when native auxiliary PnL fields are unavailable', t => {
+  const context = setup(t); context.store.saveSnapshot(A, snapshot({ summary: { ...snapshot().summary, realizedPnl: null, unrealizedPnl: null } }));
+  const result = context.store.getSnapshot(A, 'all');
+  assert.equal(result.period.totalPnl, 10); assert.equal(result.period.complete, true);
+  assert.equal(result.period.pnlBasis, 'polymarket-trade-pnl');
 });

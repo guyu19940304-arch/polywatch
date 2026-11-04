@@ -58,6 +58,7 @@ jobs:
           node -e "const h=JSON.parse(require('fs').readFileSync('/tmp/polywatch-health.json')); if(h.status!=='ok') process.exit(1)"
           curl --fail --silent http://127.0.0.1:18787/ | grep -q '<div id="root">'
           docker exec polywatch-smoke node --input-type=module -e "import {createStore} from './server/store.mjs'; const s=createStore({path:'/data/smoke.sqlite'}); s.close();"
+          docker exec polywatch-smoke node server/store.mjs compact /data/smoke.sqlite /data/smoke-compact.sqlite
       - name: Publish to GitHub Container Registry
         if: github.event_name != 'pull_request'
         env:
